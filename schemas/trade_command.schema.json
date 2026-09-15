@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "command_type", "exchange", "base_asset", "side", "entry",
+    "take_profits", "stop_loss", "quantity", "confidence",
+    "ambiguities", "trade_id", "breakeven"
+  ],
+  "properties": {
+    "command_type": {
+      "type": "string",
+      "enum": ["OPEN_POSITION", "AMEND_ENTRY", "CANCEL_ORDER", "CLOSE_POSITION", "MOVE_STOP"]
+    },
+    "exchange": {
+      "type": ["string", "null"],
+      "enum": ["OKX", "BINANCE", "GATE", null]
+    },
+    "base_asset": {"type": "string", "minLength": 1},
+    "side": {"type": "string", "enum": ["LONG", "SHORT"]},
+    "entry": {
+      "anyOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "low", "high"],
+          "properties": {
+            "type": {"type": "string", "enum": ["RANGE", "LIMIT"]},
+            "low": {"type": "string"},
+            "high": {"type": "string"}
+          }
+        }
+      ]
+    },
+    "take_profits": {"type": "array", "items": {"type": "string"}},
+    "stop_loss": {"type": ["string", "null"]},
+    "quantity": {"type": ["string", "null"]},
+    "confidence": {"type": "string"},
+    "ambiguities": {"type": "array", "items": {"type": "string"}},
+    "trade_id": {"type": ["string", "null"]},
+    "breakeven": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trigger_ratio", "profit_price_ratio"],
+      "properties": {
+        "trigger_ratio": {"type": "string"},
+        "profit_price_ratio": {"type": "string"}
+      }
+    }
+  }
+}

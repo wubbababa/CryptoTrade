@@ -1,0 +1,63 @@
+telegram:
+  enabled: true
+  poll_timeout_seconds: 30
+  report_chat_id: null
+
+# 默认使用 DeepSeek API 进行自然语言交易公告结构化解析
+deepseek:
+  # API 密钥优先从系统环境变量 DEEPSEEK_API_KEY 读取，也可在此配置
+  api_key: ""
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-chat"
+  timeout_seconds: 30
+  minimum_confidence: "0.90"
+
+# 备用 Codex CLI 配置（当前已停用）
+# codex:
+#   command: codex
+#   timeout_seconds: 45
+#   minimum_confidence: "0.90"
+
+trading:
+  default_exchange: OKX
+  asset_whitelist: [BTC, ETH, SOL, XAU, PAXG, XAUT]
+  # 每笔交易使用账户权益的 2% 作为保证金，100 倍杠杆对应 2 倍账户权益的名义仓位。
+  position_margin_ratio: "0.02"
+  leverage: "100"
+  new_positions_enabled: true
+  market_type: USDT_PERPETUAL
+
+exchanges:
+  OKX:
+    enabled: true
+    # DEMO=OKX 官方模拟盘，LIVE=实盘，LOCAL=仅本地模拟。
+    mode: DEMO
+    market_stream_assets: [BTC, ETH, SOL, XAU, PAXG, XAUT]
+    position_mode: ONE_WAY
+    margin_mode: CROSS
+    paper_equity_usdt: "10000"
+    max_position_notional_ratio: "2"
+    max_leverage: "100"
+  BINANCE:
+    enabled: true
+    # TESTNET=Binance 官方测试网，LIVE=实盘，LOCAL=仅本地模拟。
+    mode: TESTNET
+    market_stream_assets: [BTC, ETH, SOL, XAU, PAXG, XAUT]
+    position_mode: ONE_WAY
+    margin_mode: CROSS
+    paper_equity_usdt: "10000"
+    max_position_notional_ratio: "2"
+    max_leverage: "100"
+  GATE:
+    enabled: true
+    # TESTNET=Gate 官方测试网，LIVE=实盘，LOCAL=仅本地模拟。
+    mode: TESTNET
+    market_stream_assets: [BTC, ETH, SOL, XAU, PAXG, XAUT]
+    position_mode: ONE_WAY
+    margin_mode: CROSS
+    paper_equity_usdt: "10000"
+    max_position_notional_ratio: "2"
+    max_leverage: "100"
+
+database_path: trading.db
+log_path: logs/trading.jsonl

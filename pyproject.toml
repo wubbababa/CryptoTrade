@@ -1,0 +1,15 @@
+[project]
+name = "crypto-trade"
+version = "0.1.0"
+description = "Telegram 公告驱动的多交易所永续合约交易系统"
+requires-python = ">=3.10"
+dependencies = [
+  "aiohttp>=3.10,<4",
+  "PyYAML>=6.0,<7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
