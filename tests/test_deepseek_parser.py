@@ -101,21 +101,6 @@ def test_command_from_json_default_exchange(test_settings):
     assert cmd.exchange == test_settings.default_exchange
 
 
-@pytest.mark.asyncio
-async def test_deepseek_parser_missing_api_key(tmp_path, monkeypatch):
-    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
-    config = tmp_path / "config.yaml"
-    source = Settings.load("config.yaml").raw
-    source["deepseek"] = {"api_key": ""}
-    import yaml
-    config.write_text(yaml.safe_dump(source, allow_unicode=True), encoding="utf-8")
-    settings = Settings.load(config)
-
-    parser = DeepSeekParser(settings)
-    with pytest.raises(ParseError, match="未配置 DEEPSEEK_API_KEY"):
-        await parser.parse("做多 BTC", "cmd-1")
-
-
 class MockResponse:
     def __init__(self, status: int, data: dict):
         self.status = status

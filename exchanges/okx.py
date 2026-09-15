@@ -42,6 +42,11 @@ class OKXAdapter(ExchangeAdapter):
         self.order_symbols: dict[str, str] = {}
         self._closed, self._leverage_set = False, set()
 
+    @property
+    def entry_protection_attached(self) -> bool:
+        """OKX 的 attachAlgoOrds 与开仓订单由同一请求提交。"""
+        return True
+
     async def resolve_leverage(self, instrument: Instrument, requested: Decimal,
                                margin_mode: str) -> Decimal:
         """查询合约档位上限，避免 set-leverage 因 59102 拒绝下单。"""

@@ -79,18 +79,28 @@ class TradingService:
             stop_loss_price=sl_price,
         )
         try:
-            result = await adapter.place_entry_order(request)
+            # 先持久化可关联的客户订单号，再请求交易所，防止成交推送先于 HTTP 回包到达。
             await self.database.execute(
                 "INSERT INTO orders(trade_id,exchange_order_id,client_order_id,order_type,price,quantity,status) "
                 "VALUES(?,?,?,?,?,?,?)",
-                (trade_id, result.exchange_order_id, result.client_order_id, "ENTRY",
-                 str(entry_price), str(command.quantity), result.status),
+                (trade_id, None, client_id, "ENTRY", str(entry_price), str(command.quantity), "SUBMITTING"),
+            )
+            await self.database.execute(
+                "UPDATE commands SET trade_id=?,status='SUBMITTING' WHERE command_id=?",
+                (trade_id, command.command_id),
+            )
+            result = await adapter.place_entry_order(request)
+            await self.database.execute(
+                "UPDATE orders SET exchange_order_id=?,status=? WHERE client_order_id=?",
+                (result.exchange_order_id, result.status, client_id),
             )
             await self.database.execute("UPDATE commands SET trade_id=?,status='EXECUTED' WHERE command_id=?",
                                         (trade_id, command.command_id))
             await self.states.transition(trade_id, TradeState.PENDING_ENTRY)
             await self.database.audit("PLACE_ENTRY", trade_id, "SUCCESS", after=result.raw)
         except Exception as exc:
+            await self.database.execute("UPDATE orders SET status='REJECTED' WHERE client_order_id=?", (client_id,))
+            await self.database.execute("UPDATE commands SET status='REJECTED' WHERE command_id=?", (command.command_id,))
             await self.states.transition(trade_id, TradeState.REJECTED)
             await self.database.audit("PLACE_ENTRY", trade_id, f"FAILED: {exc}")
             raise

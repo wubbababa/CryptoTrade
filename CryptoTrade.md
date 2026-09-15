@@ -1,8 +1,8 @@
-# TG 公告群 × Codex × 多交易所自动交易系统
+# TG 公告群 × DeepSeek × 多交易所自动交易系统
 
 ## 1. 项目目标
 
-在一台本地 Windows 或 Linux 电脑上手动运行交易程序，持续读取指定 Telegram 公告群消息，使用 Codex 将自然语言转换为结构化交易指令，经确定性规则与风险校验后，在以下交易所(实盘+模拟盘)执行：
+在一台本地 Windows 或 Linux 电脑上手动运行交易程序，持续读取指定 Telegram 公告群消息，使用 DeepSeek API 将自然语言转换为结构化交易指令，经确定性规则与风险校验后，在以下交易所(实盘+模拟盘)执行：
 
 - OKX
 - Binance
@@ -17,8 +17,8 @@
 ```mermaid
 flowchart LR
     TG["Telegram 公告群"] --> APP["本地 Python 主程序"]
-    APP --> CODEX["Codex 指令解析"]
-    CODEX --> CHECK["状态与风控校验"]
+    APP --> DEEPSEEK["DeepSeek 指令解析"]
+    DEEPSEEK --> CHECK["状态与风控校验"]
     CHECK --> ROUTER["交易所路由器"]
     ROUTER --> OKX["OKX 适配器"]
     ROUTER --> BN["Binance 适配器"]
@@ -30,7 +30,7 @@ flowchart LR
 主程序由以下七个模块组成：
 
 1. Telegram 长轮询监听器；
-2. Codex 指令解析器；
+2. DeepSeek 指令解析器；
 3. 确定性校验与风控模块；
 4. 交易状态管理器；
 5. 交易所路由器与三个交易所适配器；
@@ -44,7 +44,7 @@ flowchart LR
 | 开发语言 | Python 3.10+ |
 | 并发模型 | `asyncio` |
 | Telegram | Bot API 长轮询；无法加入目标频道时再评估用户客户端方案 |
-| 自然语言解析 | 本地调用 Codex CLI |
+| 自然语言解析 | DeepSeek API（`deepseek-chat`） |
 | 解析输出 | 严格 JSON Schema |
 | OKX/Binance/Gate | 各自 REST API + WebSocket |
 | 本地数据库 | SQLite，启用 WAL 模式 |
@@ -59,7 +59,7 @@ flowchart LR
 ```mermaid
 flowchart TD
     A["收到 TG 消息"] --> B["保存原文并去重"]
-    B --> C["Codex 输出统一 JSON"]
+    B --> C["DeepSeek 输出统一 JSON"]
     C --> D{"结构与交易逻辑有效？"}
     D -->|否| X["拒绝执行并回报"]
     D -->|是| E["读取本地交易状态"]
@@ -73,9 +73,11 @@ flowchart TD
 
 系统启动时不执行 Telegram 积压的历史交易信号，只处理本次启动之后收到的新消息；但必须读取三家交易所已有的挂单和仓位，用于恢复监控并防止误操作。
 
-## 5. Codex 指令解析
+## 5. DeepSeek 指令解析
 
-Codex只负责理解文字并生成交易意图，不允许直接持有交易所密钥，也不允许直接调用交易所API。
+DeepSeek 只负责理解文字并生成交易意图；交易所密钥仅由本地程序读取，模型不能直接调用交易所 API。当前默认模型为 `deepseek-chat`，通过 `DEEPSEEK_API_KEY` 鉴权。
+
+`codex_parser.py` 为停用的备用解析器，不属于默认运行链路。
 
 示例公告：
 
@@ -277,7 +279,8 @@ SQLite启用WAL模式；所有订单状态写入必须在短事务中完成。�
 tg-multi-exchange-trader/
 ├── main.py
 ├── telegram_client.py
-├── codex_parser.py
+├── deepseek_parser.py
+├── codex_parser.py              # 停用的备用解析器
 ├── validator.py
 ├── risk_manager.py
 ├── state_manager.py
@@ -302,7 +305,7 @@ tg-multi-exchange-trader/
 
 1. 用户手动运行程序；
 2. 加载本地配置和密钥；
-3. 连接Codex和Telegram；
+3. 连接 DeepSeek API 和 Telegram；
 4. 分别连接启用的交易所；
 5. 读取交易产品规则；
 6. 查询三家交易所挂单与仓位；
@@ -346,6 +349,6 @@ tg-multi-exchange-trader/
 
 ## 15. 最终架构结论
 
-本系统保持一个本地Python项目，不使用服务器和开机自启。Telegram通过长轮询提供消息，Codex将自然语言转换成统一交易JSON，确定性校验器负责安全审查，交易所路由器再将指令交给OKX、Binance或Gate适配器。三家交易所的合约代码、精度、数量单位、仓位模式和止盈止损差异全部封装在适配层；SQLite保存本地状态和审计记录，WebSocket负责行情、成交及仓位监控。
+本系统保持一个本地 Python 项目，不使用服务器和开机自启。Telegram 通过长轮询提供消息，DeepSeek 将自然语言转换成统一交易 JSON，确定性校验器负责安全审查，交易所路由器再将指令交给 OKX、Binance 或 Gate 适配器。三家交易所的合约代码、精度、数量单位、仓位模式和止盈止损差异全部封装在适配层；SQLite 保存本地状态和审计记录，WebSocket 负责行情、成交及仓位监控。
 
-> 自动交易具有实际资金风险。Codex解析结果不得绕过规则校验直接下单，正式运行前必须完成历史消息回放、模拟环境验证和小额实盘测试。
+> 自动交易具有实际资金风险。DeepSeek 解析结果不得绕过规则校验直接下单，正式运行前必须完成历史消息回放、模拟环境验证和小额实盘测试。

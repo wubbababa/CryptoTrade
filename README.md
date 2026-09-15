@@ -1,6 +1,6 @@
 # CryptoTrade
 
-这是 `CryptoTrade.md` 的安全第一版实现：Telegram Bot 长轮询接收公告，本机 Codex CLI
+这是 `CryptoTrade.md` 的安全第一版实现：Telegram Bot 长轮询接收公告，默认由 DeepSeek API
 输出结构化指令，确定性校验与风险模块审批后，路由到 OKX、Binance 或 Gate 的独立适配器。
 
 当前默认连接 OKX 官方模拟盘、Binance 官方测试网和 Gate 官方测试网。三个适配器封装了各自
@@ -16,13 +16,12 @@ Copy-Item .env.example .env
 python main.py
 ```
 
-程序启动时会检查 `codex` 命令是否存在，并兼容 Windows 上由 pnpm/npm 安装的 `codex.CMD`。
-可以先用 `codex --version` 验证 Codex CLI 已安装并完成登录。
-公告解析使用 `schemas/trade_command.schema.json` 约束最终输出，并通过临时文件读取 Codex 的
-最终回答，不会把 CLI 的过程事件误识别成交易指令。
+公告解析默认调用 DeepSeek 的 `deepseek-chat` 模型；请在 `.env` 中设置 `DEEPSEEK_API_KEY`。
+解析输出必须符合 `schemas/trade_command.schema.json`，并始终经过确定性校验后才可能下单。
+`codex_parser.py` 仍作为停用的备用实现保留，但当前入口不会调用 Codex CLI。
 
-默认 `telegram.enabled: false`，程序只执行启动对账。接入 Telegram 时，在 `.env` 填入 Bot
-Token，并在 `.env` 配置来源 Chat ID。当前默认已经启用；首次启动会丢弃历史积压，
+默认 `telegram.enabled: true`；未配置有效 Bot Token 时无法接收公告。接入 Telegram 时，在 `.env` 填入 Bot
+Token，并在 `.env` 配置来源 Chat ID。首次启动会丢弃历史积压，
 只处理启动后消息。
 
 私密来源频道必须把 Bot 加为管理员，并在 `.env` 配置 `TELEGRAM_SOURCE_CHAT_ID`。获取 ID：

@@ -17,6 +17,12 @@ class ExchangeError(RuntimeError):
 
 
 class ExchangeAdapter(ABC):
+    @property
+    def entry_protection_attached(self) -> bool:
+        """开仓请求是否由交易所原子地附带止盈止损。"""
+        # 默认采用成交后补建保护单，避免误以为交易所已经接受了保护参数。
+        return False
+
     async def resolve_leverage(self, instrument: Instrument, requested: Decimal,
                                margin_mode: str) -> Decimal:
         """返回交易所允许的实际杠杆；默认适配器直接采用配置值。"""
@@ -78,6 +84,11 @@ class PaperAdapter(ExchangeAdapter):
         self.positions: list[PositionSnapshot] = []
         self._events: asyncio.Queue[dict] = asyncio.Queue()
         self._closed = False
+
+    @property
+    def entry_protection_attached(self) -> bool:
+        """本地模拟盘把保护价格保存在同一笔开仓记录中。"""
+        return True
 
     async def load_instruments(self) -> dict[str, Instrument]:
         return self.instruments

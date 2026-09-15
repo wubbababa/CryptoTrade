@@ -7,7 +7,9 @@ from breakeven_strategy import calculate_breakeven, should_trigger, stop_only_im
 from codex_parser import _extract_json, build_subprocess_command, command_from_json
 from database import Database
 from exchange_router import ExchangeRouter
-from models import PositionSide
+from exchanges.base import PaperAdapter
+from models import Exchange, PositionSide, PositionSnapshot
+from monitor import Monitor
 from position_sizer import PositionSizer
 from risk_manager import RiskManager
 from settings import Settings
@@ -135,3 +137,78 @@ def test_paper_order_is_idempotent(settings):
     # 验证 PaperAdapter 订单中包含了附带的第一止盈目标与止损价格
     assert open_orders[0].raw.get("take_profit_price") == "2519"
     assert open_orders[0].raw.get("stop_loss_price") == "2455"
+
+
+def test_filled_entry_creates_protection_orders_and_opens_trade(settings):
+    """成交事件应推进状态，并为非原子保护单交易所补建止盈止损。"""
+    class DeferredProtectionPaperAdapter(PaperAdapter):
+        @property
+        def entry_protection_attached(self) -> bool:
+            return False
+
+    async def scenario():
+        database = Database(settings.database_path)
+        database.initialize()
+        router = ExchangeRouter(settings)
+        original = router.get(Exchange.BINANCE)
+        adapter = DeferredProtectionPaperAdapter(original.instruments, original.equity)
+        router.adapters[Exchange.BINANCE] = adapter
+        service = TradingService(settings, database, router)
+        command = command_from_json(valid_payload(), "tg-fill-1", settings)
+        await service.execute(command)
+        entry = (await database.fetch_all("SELECT * FROM orders WHERE order_type='ENTRY'"))[0]
+        adapter.positions = [PositionSnapshot(
+            Exchange.BINANCE, command.instrument_key, command.side, Decimal("0.8"), Decimal("2480"),
+        )]
+        monitor = Monitor(router, database)
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {"c": entry["client_order_id"], "X": "FILLED"}},
+        })
+        orders = await database.fetch_all("SELECT order_type,status FROM orders ORDER BY id")
+        trade = (await database.fetch_all("SELECT state FROM trade_instances"))[0]
+        await router.close()
+        return orders, trade
+
+    orders, trade = asyncio.run(scenario())
+    assert [row["order_type"] for row in orders] == ["ENTRY", "TAKE_PROFIT", "STOP_LOSS"]
+    assert trade["state"] == "OPEN"
+
+
+def test_market_event_moves_stop_to_breakeven_once(settings):
+    """达到目标 50% 后应以真实均价上移止损，且不重复触发。"""
+    class DeferredProtectionPaperAdapter(PaperAdapter):
+        @property
+        def entry_protection_attached(self) -> bool:
+            return False
+
+    async def scenario():
+        database = Database(settings.database_path)
+        database.initialize()
+        router = ExchangeRouter(settings)
+        original = router.get(Exchange.BINANCE)
+        adapter = DeferredProtectionPaperAdapter(original.instruments, original.equity)
+        router.adapters[Exchange.BINANCE] = adapter
+        command = command_from_json(valid_payload(), "tg-breakeven-1", settings)
+        await TradingService(settings, database, router).execute(command)
+        entry = (await database.fetch_all("SELECT * FROM orders WHERE order_type='ENTRY'"))[0]
+        adapter.positions = [PositionSnapshot(
+            Exchange.BINANCE, command.instrument_key, command.side, Decimal("0.8"), Decimal("2480"),
+        )]
+        monitor = Monitor(router, database)
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {"c": entry["client_order_id"], "X": "FILLED"}},
+        })
+        # 最终止盈 2549 的 50% 触发价为 2514.5，2520 已满足触发条件。
+        tick = {"data": {"e": "markPriceUpdate", "s": "ETHUSDT", "p": "2520"}}
+        await monitor.process_event(Exchange.BINANCE, adapter, tick)
+        await monitor.process_event(Exchange.BINANCE, adapter, tick)
+        stops = await database.fetch_all(
+            "SELECT price,status FROM orders WHERE order_type='STOP_LOSS' ORDER BY id"
+        )
+        trade = (await database.fetch_all("SELECT breakeven_triggered FROM trade_instances"))[0]
+        await router.close()
+        return stops, trade
+
+    stops, trade = asyncio.run(scenario())
+    assert [(row["price"], row["status"]) for row in stops] == [("2455", "CANCELED"), ("2504.80", "NEW")]
+    assert trade["breakeven_triggered"] == 1
