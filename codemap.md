@@ -13,6 +13,8 @@ CryptoTrade 是一个由 Telegram 公告/频道信号驱动的多交易所（OKX
 ```mermaid
 flowchart TD
     A[Telegram 频道 / 群组] -->|自然语言公告| B(TelegramClient 轮询抓取)
+    B -->|以 / 开头的只读命令| P[TelegramCommandHandler 状态查询]
+    P -->|仅汇总本地与交易所只读状态| O[运行回报]
     B -->|文本去重与入库| C[(SQLite 数据库)]
     B -->|原始文本| D[DeepSeekParser]
     D -->|调用 DeepSeek API| D1[DeepSeek-V3 / Chat]
@@ -20,6 +22,7 @@ flowchart TD
     D -->|转换为领域对象 TradeCommand| E[CommandValidator 确定性校验]
     E -->|规则校验通过| F[TradingService 交易用例编排]
     F -->|计算账户权益与杠杆| G[PositionSizer 仓位计算]
+    F -->|公告未指定交易所时按默认目标逐家广播| J
     F -->|名义持仓与风险核验| H[RiskManager 风险管理]
     F -->|状态迁移至 PENDING_ENTRY| I[StateManager 状态机]
     F -->|统一接口路由| J[ExchangeRouter 交易所路由]
@@ -32,6 +35,8 @@ flowchart TD
     M -->|达到保本条件时更新止损| J
     F -->|命令结果| N[EventNotifier]
     L -->|对账/保本/故障| N
+    Q[TradeCleaner 僵尸交易清理] -->|仅收敛本地状态| C
+    Q -->|只读核对持仓与挂单| J
     N -->|审计、JSONL、Telegram| O[运行回报]
 ```
 
@@ -44,7 +49,7 @@ flowchart TD
 | 文件 | 核心类 / 函数 | 职责与功能说明 |
 | :--- | :--- | :--- |
 | [`main.py`](file:///f:/projects/CryptoTrade/main.py) | `Application`, `async_main`, `main` | **程序主入口**：负责初始化数据库、多交易所路由、监控器、DeepSeek 解析器与 Telegram 客户端；支持 `--dev` 开发测试参数；捕获退出信号并优雅停机。 |
-| [`dev_runner.py`](file:///f:/projects/CryptoTrade/dev_runner.py) | `run_dev_test` | **开发者测试套件**：支持通过 `python main.py --dev` 调试 DeepSeek API 连通性、打印原始返回与结构化实体，并端到端完成本地模拟开仓。 |
+| [`dev_runner.py`](file:///f:/projects/CryptoTrade/dev_runner.py) | `run_dev_test` | **开发者测试套件**：支持通过 `python main.py --dev` 调试 DeepSeek API 连通性、打印原始返回与结构化实体，并端到端完成开仓。它复用真实的 `ExchangeRouter`：**已配置凭据的交易所会真实下单**（缺凭据的目标仅提示跳过），因此 `--dev` 是当前唯一能暴露真实交易所接口拒单的常规手段（见 §6.1）。 |
 | [`settings.py`](file:///f:/projects/CryptoTrade/settings.py) | `Settings`, `_load_dotenv` | **配置管理与密钥隔离**：轻量读取 `.env` 环境变量与 `config.yaml` 配置文件，提供强类型配置属性访问。 |
 | [`exchanges/credentials.py`](file:///f:/projects/CryptoTrade/exchanges/credentials.py) | `credentials` | **环境凭据隔离**：严格按交易所模式读取 `*_DEMO_*`、`*_TESTNET_*` 或 `*_LIVE_*` 变量，允许同一 `.env` 保存两套凭据而不混用。 |
 | [`app_logging.py`](file:///f:/projects/CryptoTrade/app_logging.py) | `configure_logging`, `JsonlFormatter` | **结构化日志系统**：配置控制台与文件日志输出，记录结构化 JSONL 运行轨迹。 |
@@ -66,11 +71,12 @@ flowchart TD
 
 | 文件 | 核心类 / 函数 | 职责与功能说明 |
 | :--- | :--- | :--- |
-| [`trading_service.py`](file:///f:/projects/CryptoTrade/trading_service.py) | `TradingService` | **交易用例编排层**：负责指令幂等落库、账户权益获取、动态名义仓位计算、风险检查、进场限价挂单，以及基于 `trade_id` 远端核对的改挂单、撤单、止损恢复和市价平仓。 |
+| [`trading_service.py`](file:///f:/projects/CryptoTrade/trading_service.py) | `TradingService`, `_execute_default_exchanges`, `_place_binance_pending_protection` | **交易用例编排层**：负责指令幂等落库、账户权益获取、动态名义仓位计算、风险检查、进场限价挂单，以及基于 `trade_id` 远端核对的改挂单、撤单、止损恢复和市价平仓。公告未指定交易所的开仓指令会按 `trading.default_exchanges` **逐交易所独立广播**（子指令编号形如 `<command_id>-OKX`，各自幂等与审计），单家失败不阻断其余交易所，并在回报中标注跳过原因。 |
 | [`position_sizer.py`](file:///f:/projects/CryptoTrade/position_sizer.py) | `PositionSizer` | **资金管理与仓位计算**：根据配置的保证金比例（默认账户权益 2%）与杠杆倍数（默认 100x）计算实际开仓标的数量。 |
 | [`risk_manager.py`](file:///f:/projects/CryptoTrade/risk_manager.py) | `RiskManager`, `RiskExceededError` | **风控检查**：对指令名义价值进行上限校验（如不得超过账户权益的 2 倍），超出即熔断拒绝。 |
 | [`breakeven_strategy.py`](file:///f:/projects/CryptoTrade/breakeven_strategy.py) | `calculate_breakeven`, `should_trigger`, `stop_only_improves` | **动态保本策略计算**：计算盈利进度达 50%（或自定义比例）时的触发价格，并将止损单动态抬升/下移至进场价上方 1% 处锁定利润。 |
 | [`state_manager.py`](file:///f:/projects/CryptoTrade/state_manager.py) | `StateManager` | **交易状态机管理**：管理单笔交易在生命周期中的状态流转（`RECEIVED` $\to$ `PENDING_ENTRY` $\to$ `OPEN` $\to$ `CLOSED` 等）。 |
+| [`trade_cleanup.py`](file:///f:/projects/CryptoTrade/trade_cleanup.py) | `TradeCleaner`, `CleanupReport`, `run_cleanup`, `main` | **僵尸交易清理**：收敛因失败或中断而卡住的本地交易记录（CLI：`py trade_cleanup.py [--unlock] [--dry-run]`）。**只写本地数据库，绝不下单、撤单或平仓**；默认清理「无活动订单」的未成交交易，`ERROR_LOCKED` 需显式 `--unlock` 且必须在确认远程无持仓、无挂单后才解除，否则跳过并说明原因。 |
 
 ---
 
@@ -81,7 +87,7 @@ flowchart TD
 | [`exchange_router.py`](file:///f:/projects/CryptoTrade/exchange_router.py) | `ExchangeRouter` | **交易所路由分发**：屏蔽底层交易所差异，根据指令中的交易所枚举将操作分发给对应的 Adapter；支持实盘保护开关（`ALLOW_LIVE_TRADING`）。 |
 | [`exchanges/base.py`](file:///f:/projects/CryptoTrade/exchanges/base.py) | `ExchangeAdapter` (抽象基类), `PaperAdapter` (本地模拟盘) | **统一适配器接口规范**：定义获取权益、获取合约信息、下单（含附带 TP/SL）、撤单、持仓查询等统一抽象异步方法。 |
 | [`exchanges/okx.py`](file:///f:/projects/CryptoTrade/exchanges/okx.py) | `OKXAdapter` | **OKX 官方对接适配器**：支持 OKX 模拟盘（Demo）与实盘（Live），下单前查询具体合约的实际杠杆上限并自动下调，避免 59102 拒单；结合标记价校验可能成交价与附带 TP/SL 的方向，提前拦截币种价格错配及 51051；实现基于 HMAC-SHA256 的请求签名认证与永续合约交互。 |
-| [`exchanges/binance.py`](file:///f:/projects/CryptoTrade/exchanges/binance.py) | `BinanceAdapter` | **Binance 官方对接适配器**：支持 Binance USDⓈ-M Futures 测试网（Testnet）与实盘，处理基于 Timestamp/HMAC 的交易接口；进场单受理后使用 `closePosition=true` 立即预挂 TP/SL 条件单。 |
+| [`exchanges/binance.py`](file:///f:/projects/CryptoTrade/exchanges/binance.py) | `BinanceAdapter`, `_conditional`, `_regular` | **Binance 官方对接适配器**：支持 Binance USDⓈ-M Futures 测试网（Testnet）与实盘，处理基于 Timestamp/HMAC 的交易接口；保护单统一以「`quantity` + `reduceOnly=true`」提交（`closePosition` 全平语义因未持仓时会被拒单已移除），由 `Monitor` 在成交后按真实持仓数量补建。 |
 | [`exchanges/gate.py`](file:///f:/projects/CryptoTrade/exchanges/gate.py) | `GateAdapter` | **Gate.io 官方对接适配器**：支持 Gate Futures 测试网与实盘，实现标准 API 签名与合约下单。 |
 
 ---
@@ -91,7 +97,8 @@ flowchart TD
 | 文件 | 核心类 / 函数 | 职责与功能说明 |
 | :--- | :--- | :--- |
 | [`monitor.py`](file:///f:/projects/CryptoTrade/monitor.py) | `Monitor` | **后台监控与启动对账引擎**：系统启动时按数量精确关联本地交易与远程仓位并恢复可监控交易；消费订单/行情事件，触发动态保本与保护单故障通知。 |
-| [`telegram_client.py`](file:///f:/projects/CryptoTrade/telegram_client.py) | `TelegramClient` | **Telegram 接口交互**：使用 Telegram Bot API 长轮询接收频道/群组新消息，支持发送交易执行结果回报。 |
+| [`telegram_client.py`](file:///f:/projects/CryptoTrade/telegram_client.py) | `TelegramClient` | **Telegram 接口交互**：使用 Telegram Bot API 长轮询接收频道/群组新消息，支持发送交易执行结果回报；来源频道与白名单私聊中的 `/` 开头文本会转交命令层，其余文本仍按交易公告解析。 |
+| [`telegram_commands.py`](file:///f:/projects/CryptoTrade/telegram_commands.py) | `TelegramCommandHandler`, `parse_command`, `UnknownCommand` | **Telegram 只读命令层**：实现 `/start`、`/help`、`/status`，汇总本地交易统计、活动交易、本地活动挂单、各交易所权益与最近指令。**不含任何下单/平仓动作**，交易动作仍只能由来源频道公告经解析与校验后触发。 |
 | [`database.py`](file:///f:/projects/CryptoTrade/database.py) | `Database` | **SQLite 数据持久化**：启用 WAL 模式和外键约束，管理消息、交易实例、订单、持仓快照、指令与审计日志表。 |
 
 ---
@@ -158,13 +165,27 @@ exchanges:
   OKX:
     enabled: true
     mode: DEMO                     # DEMO=OKX 官方模拟盘, LIVE=实盘, LOCAL=仅本地模拟
+    position_mode: ONE_WAY         # 单向持仓
+    margin_mode: CROSS             # 全仓保证金
+    max_position_notional_ratio: "2" # 名义价值上限倍数（风控熔断阈值）
+    max_leverage: "100"
   BINANCE:
     enabled: true
-    mode: TESTNET                  # TESTNET=Binance 测试网, LIVE=实盘, LOCAL=仅本地模拟
+    mode: TESTNET                  # TESTNET=Binance 官方测试网, LIVE=实盘, LOCAL=仅本地模拟
+    position_mode: ONE_WAY
+    margin_mode: CROSS
+    max_position_notional_ratio: "2"
+    max_leverage: "100"
   GATE:
     enabled: true
-    mode: TESTNET                  # TESTNET=Gate 测试网, LIVE=实盘, LOCAL=仅本地模拟
+    mode: TESTNET                  # TESTNET=Gate 官方测试网, LIVE=实盘, LOCAL=仅本地模拟
+    position_mode: ONE_WAY
+    margin_mode: CROSS
+    max_position_notional_ratio: "2"
+    max_leverage: "100"
 ```
+
+> `enabled: true` 仅表示「纳入启动尝试」，实际是否接通取决于对应模式的环境变量是否齐备（见 §4.2）；`market_stream_assets` 与 `paper_equity_usdt` 为各交易所的可选项。
 
 ### 4.2 环境变量 (`.env`)
 
@@ -172,8 +193,10 @@ exchanges:
 - `TELEGRAM_BOT_TOKEN`: 用于接收公告和发送回报的 Telegram Bot Token。
 - `ALLOW_LIVE_TRADING`: 实盘保护总开关（必须显式设为 `true` 才能以 `LIVE` 模式启动）。
 - `OKX_DEMO_API_KEY` / `OKX_LIVE_API_KEY`（及对应 Secret、Passphrase）：OKX 模拟盘/实盘凭据。
-- `BINANCE_TESTNET_API_KEY` / `BINANCE_LIVE_API_KEY`（及对应 Secret）：Binance 测试网/实盘凭据。
+- `BINANCE_TESTNET_API_KEY` / `BINANCE_LIVE_API_KEY`（及对应 Secret）：Binance 测试网/实盘凭据。测试网默认 REST 域名为 `https://demo-fapi.binance.com`（可用 `rest_base` 覆盖）。
 - `GATE_TESTNET_API_KEY` / `GATE_LIVE_API_KEY`（及对应 Secret）：Gate 测试网/实盘凭据。
+
+> 凭据按「交易所 + 模式」严格隔离：`config.yaml` 中某交易所 `enabled: true` 但对应模式的环境变量为空时，`ExchangeRouter` 会在启动时以「缺少环境变量」禁用该交易所并记录到 `unavailable_reasons`——**配置启用不等于已接通**。当前状态：OKX DEMO 与 Binance TESTNET 已配置，Gate TESTNET 未配置（详见 §6.2）。
 
 ---
 
@@ -194,31 +217,15 @@ py -m pytest
 - [`tests/test_telegram_config.py`](file:///f:/projects/CryptoTrade/tests/test_telegram_config.py)：Telegram 配置加载与消息解析验证。
 - [`tests/test_credentials.py`](file:///f:/projects/CryptoTrade/tests/test_credentials.py)：模拟盘与实盘凭据严格隔离测试。
 - [`tests/test_notifications.py`](file:///f:/projects/CryptoTrade/tests/test_notifications.py)：通知审计、级别开关和 Telegram 回报格式测试。
+- [`tests/test_telegram_commands.py`](file:///f:/projects/CryptoTrade/tests/test_telegram_commands.py)：Telegram 只读命令解析与 `/status` 输出内容测试。
+- [`tests/test_cleanup.py`](file:///f:/projects/CryptoTrade/tests/test_cleanup.py)：僵尸交易清理的安全边界测试（有序交易不误清、部分成交不清理、无法核对远程不解锁、dry-run 不写库）。
+
+当前基线：`py -m pytest` 共 **70 项全部通过**（2026-09-16）。注意测试全部基于本地 `PaperAdapter` 或桩替换，**不覆盖真实交易所网络行为**（`credentials.py` 的凭据读取在导入配置阶段即触发，未配置凭据的交易所无法被真实替换），因此真实接口拒单只能靠 `--dev` 实跑或线上对账发现（详见 [`devPLAN.md`](devPLAN.md) §2.1、§3.1）。
 
 ---
 
-## 6. 当前未完成能力与开发顺序
 
-以下能力尚未完成或尚未接通，按风险优先级维护：
-
-1. **自动保本策略执行**：已接入 OKX、Binance、Gate 行情事件；对于本地已跟踪的止损单，达到目标进度后会按真实持仓均价创建更优止损、撤销旧止损，并持久化 `breakeven_triggered`。旧版 OKX 原子附带保护单尚未保存可撤销的 Algo ID，因此不会猜测并修改该类订单。
-2. **启动后的持仓恢复**：启动对账会刷新仓位快照，并且仅在“交易所 + 合约 + 方向”下本地进场数量之和与远程仓位精确一致、且没有仍开放的进场单时恢复为 `OPEN`、补建非原子保护单及继续保本监控；未关联或数量不一致的远程持仓只告警，绝不猜测归属。跨设备/清库后的历史订单重建仍未实现。
-3. **多笔同币种交易的精确关联**：已以本地 `trade_id` 的进场数量作为汇总仓位分配账本；自动保本仅在同一“交易所 + 合约 + 方向”下所有活动交易的数量之和与远程仓位精确一致时逐笔执行，否则记录审计并停止自动操作。跨设备/人工交易导致的数量差异仍需人工处置。
-4. **人工 Telegram 指令**：已开放 `AMEND_ENTRY`（仅未成交挂单）、`CANCEL_ORDER`（未成交时撤进场、已开仓时取消止损）、`MOVE_STOP`（改止损或恢复止损）与明确的 `CLOSE_POSITION` 市价平仓。每项均要求完整 `trade_id`，并核对交易所、合约、方向和远程订单/仓位；不能唯一关联则拒绝。修改止盈、补仓及“保本离场”改止盈仍待实现。
-5. **通知与可观测性**：已将启动对账、命令结果、保本移动、保护单失败和停机事件写入 SQLite 审计、JSONL 日志并按级别发送 Telegram 回报；尚未提供审计查询 CLI 或周期性运行摘要。
-6. **成交与事件安全性**：部分成交使用交易所累计成交量创建并随成交扩大而替换保护单；部分成交时拒绝撤余单；行情 ticker 不再逐条写入 SQLite；关闭时会等待已接收的 Telegram 指令完成。OKX 原子附带保护单的 Algo ID 查询/撤销关联仍待补齐，相关人工操作会安全拒绝。
-
-解析器文档已统一：`DeepSeekParser` 是默认运行链路，`codex_parser.py` 仅作为停用的备用实现保留。
-
-### 6.1 已完成的最高优先级闭环：成交状态与保护单
-
-`Monitor` 现会从 OKX、Binance、Gate 的订单 WebSocket 事件提取客户订单号和订单状态，并同步本地 `orders` 与交易状态。开仓完整成交后：
-
-- OKX 使用开仓请求中的 `attachAlgoOrds` 原子附带止盈止损；
-- Binance 在进场受理后预挂 `closePosition=true` 的止盈、止损条件单；部分成交时按实际成交量替换为精确只减仓保护单。Gate 按实际持仓数量创建只减仓的止盈、止损单，并写入订单与审计日志；
-- 保护单创建失败时将交易置为 `ERROR_LOCKED`，阻止后续自动操作并输出高优先级日志。
-
-## 7. 开发者测试模式使用指南
+## 6. 开发者测试模式使用指南
 
 无需启动 Telegram 轮询，直接在终端执行端到端链路测试：
 
@@ -228,4 +235,17 @@ python main.py --dev
 
 # 使用自定义公告文本进行测试
 python main.py --dev --signal "做多 BTC 60000-60500 止损 59000 止盈 62000"
+```
+
+清理卡住的本地交易记录（**只写数据库，不下单**）：
+
+```bash
+# 先看将要发生的变更
+python trade_cleanup.py --dry-run
+
+# 收敛无活动订单的未成交交易；--unlock 额外解除 ERROR_LOCKED（需确认远程无持仓、无挂单）
+python trade_cleanup.py --unlock
+
+# 不连交易所，仅按本地事实清理
+python trade_cleanup.py --no-router
 ```

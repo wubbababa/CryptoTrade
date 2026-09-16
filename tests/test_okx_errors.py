@@ -105,8 +105,8 @@ def test_okx_bracket_order_payload():
     assert attach["slTriggerPxType"] == "mark"
 
 
-def test_binance_pending_protection_uses_close_position():
-    """未成交进场的 Binance 保护单必须使用全平模式，不能提前传减仓数量。"""
+def test_binance_protection_uses_quantity_reduce_only():
+    """Binance 保护单必须用「数量 + reduceOnly」，不得使用会被 -4509 拒绝的 closePosition。"""
     from decimal import Decimal
     from exchanges.binance import BinanceAdapter
     from models import Instrument, OrderRequest, PositionSide
@@ -125,11 +125,34 @@ def test_binance_pending_protection_uses_close_position():
     adapter._request = mock_request
     instrument = Instrument("ETH/USDT:PERP", "ETHUSDT", Decimal("0.01"), Decimal("0.001"), Decimal("0.001"), Decimal("0"))
     request = OrderRequest(instrument, PositionSide.LONG, "SELL", "MARKET", Decimal("1"),
-                           Decimal("2500"), True, "ctpending", close_position=True)
+                           Decimal("2500"), True, "ctpending")
     asyncio.run(adapter.place_take_profit(request))
-    assert sent_params["closePosition"] == "true"
-    assert "quantity" not in sent_params
-    assert "reduceOnly" not in sent_params
+    assert sent_params["quantity"] == "1"
+    assert sent_params["reduceOnly"] == "true"
+    # closePosition 全平语义已被移除：它在未持仓时会被服务端拒绝。
+    assert "closePosition" not in sent_params
+
+
+def test_binance_protection_rejects_non_reduce_only():
+    """缺少 reduceOnly 的保护单必须在本地就被拒绝，不能带着错误参数到交易所。"""
+    from decimal import Decimal
+    from exchanges.base import ExchangeError
+    from exchanges.binance import BinanceAdapter
+    from models import Instrument, OrderRequest, PositionSide
+
+    adapter = object.__new__(BinanceAdapter)
+    adapter.order_symbols = {}
+    adapter.algo_orders = set()
+
+    async def mock_request(*args, **kwargs):
+        raise AssertionError("参数不合法时不应发起网络请求")
+
+    adapter._request = mock_request
+    instrument = Instrument("ETH/USDT:PERP", "ETHUSDT", Decimal("0.01"), Decimal("0.001"), Decimal("0.001"), Decimal("0"))
+    request = OrderRequest(instrument, PositionSide.LONG, "SELL", "MARKET", Decimal("1"),
+                           Decimal("2500"), False, "ctbad")
+    with pytest.raises(ExchangeError, match="只减仓"):
+        asyncio.run(adapter.place_stop_loss(request))
 
 
 def test_okx_leverage_is_capped_by_instrument_limit():

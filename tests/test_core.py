@@ -183,30 +183,52 @@ def test_paper_order_is_idempotent(settings):
     report, duplicate, orders, open_orders = asyncio.run(scenario())
     assert "已提交" in report
     assert "重复指令" in duplicate
-    assert [order["order_type"] for order in orders] == ["ENTRY", "TAKE_PROFIT", "STOP_LOSS"]
-    assert len(open_orders) == 3
+    # PaperAdapter 采用原子附带保护，进场单是唯一落库订单。
+    assert [order["order_type"] for order in orders] == ["ENTRY"]
+    assert len(open_orders) == 1
     # 验证 PaperAdapter 订单中包含了附带的第一止盈目标与止损价格
     assert open_orders[0].raw.get("take_profit_price") == "2519"
     assert open_orders[0].raw.get("stop_loss_price") == "2455"
 
 
-def test_binance_entry_immediately_creates_pending_protection(settings):
-    """Binance 进场单受理后应立刻预挂全平止盈止损，而非等待成交事件。"""
+def test_entry_acceptance_does_not_preplace_protection(settings):
+    """进场受理后不得预挂保护单；保护单只能由成交事件按真实持仓补建。
+
+    回归防护：Binance 在未持仓时预挂条件单会被 -4509
+    （Time in Force GTE can only be used with open positions）拒绝。
+    """
+    class DeferredProtectionPaperAdapter(PaperAdapter):
+        @property
+        def entry_protection_attached(self) -> bool:
+            return False
+
     async def scenario():
         database = Database(settings.database_path)
         database.initialize()
         router = ExchangeRouter(settings)
-        service = TradingService(settings, database, router)
-        command = command_from_json(valid_payload(), "tg-binance-pending-protection", settings)
-        await service.execute(command)
+        original = router.get(Exchange.BINANCE)
+        adapter = DeferredProtectionPaperAdapter(original.instruments, original.equity)
+        router.adapters[Exchange.BINANCE] = adapter
+        command = command_from_json(valid_payload(), "tg-no-preplace", settings)
+        report = await TradingService(settings, database, router).execute(command)
         orders = await database.fetch_all("SELECT order_type,status FROM orders ORDER BY id")
+        trade = (await database.fetch_all("SELECT state FROM trade_instances"))[0]
+        audits = await database.fetch_all(
+            "SELECT category FROM audit_logs WHERE category='PLACE_PENDING_PROTECTION'"
+        )
         await router.close()
-        return orders
+        return report, orders, trade, audits
 
-    orders = asyncio.run(scenario())
-    assert [(row["order_type"], row["status"]) for row in orders] == [
-        ("ENTRY", "NEW"), ("TAKE_PROFIT", "NEW"), ("STOP_LOSS", "NEW"),
-    ]
+    report, orders, trade, audits = asyncio.run(scenario())
+    assert "已提交" in report
+    # 回报必须展示原始指令中的 TP/SL，并说明非原子交易所将在成交后补建。
+    assert "止盈 2519/2549" in report
+    assert "止损 2455" in report
+    assert "成交后自动补建" in report
+    # 只有进场单落库，没有任何预挂保护单，也没有预挂保护审计。
+    assert [(row["order_type"], row["status"]) for row in orders] == [("ENTRY", "NEW")]
+    assert audits == []
+    assert trade["state"] == "PENDING_ENTRY"
 
 
 def test_filled_entry_creates_protection_orders_and_opens_trade(settings):
@@ -282,10 +304,10 @@ def test_partial_fill_creates_and_resizes_protection_from_actual_quantity(settin
 
     entry, entry_row, protections, trade = asyncio.run(scenario())
     assert entry_row["filled_quantity"] == entry["quantity"]
+    # 新流程不再在进场受理阶段预挂保护单，因此只剩「部分成交量」与「完整量」两条记录。
     assert [(row["quantity"], row["status"]) for row in protections] == [
-        (entry["quantity"], "CANCELED"),  # 进场受理后预挂的全平保护单
-        ("2", "CANCELED"),                # 部分成交后按实际数量创建的保护单
-        (entry["quantity"], "NEW"),        # 全部成交后按完整数量校准的保护单
+        ("2", "CANCELED"),                 # 部分成交后按实际数量创建的保护单
+        (entry["quantity"], "NEW"),         # 全部成交后按完整数量校准的保护单
     ]
     assert trade["state"] == "OPEN"
 

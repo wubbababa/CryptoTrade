@@ -10,7 +10,7 @@ from decimal import Decimal
 
 from database import Database
 from exchange_router import ExchangeRouter
-from models import CommandType, Exchange, OrderRequest, PositionSide, TradeCommand, TradeState
+from models import CommandType, OrderRequest, PositionSide, TradeCommand, TradeState
 from risk_manager import RiskManager
 from position_sizer import PositionSizer
 from settings import Settings
@@ -235,7 +235,10 @@ class TradingService:
         return report
 
     async def _cancel_pending_protection(self, trade_id: str, adapter) -> None:
-        """撤销未成交进场关联的预挂保护单，避免后续仓位被旧条件单误平。"""
+        """撤销未成交进场关联的保护单，避免后续仓位被旧条件单误平。
+
+        新流程不再在进场受理阶段预挂保护单；此清理用于兼容历史数据与重启恢复场景。
+        """
         rows = await self.database.fetch_all(
             "SELECT id,exchange_order_id FROM orders WHERE trade_id=? AND order_type IN ('TAKE_PROFIT','STOP_LOSS') "
             "AND status IN ('NEW','OPEN','PARTIALLY_FILLED')", (trade_id,),
@@ -326,22 +329,24 @@ class TradingService:
                 "UPDATE orders SET exchange_order_id=?,status=? WHERE client_order_id=?",
                 (result.exchange_order_id, result.status, client_id),
             )
-            if command.exchange == Exchange.BINANCE:
-                await self._place_binance_pending_protection(trade_id, command, instrument, adapter)
+            # 所有交易所统一采用「成交后再补建保护单」：进场尚未成交时挂条件单会被 Binance 以
+            # -4509（Time in Force GTE can only be used with open positions）拒绝，因此不在受理阶段预挂；
+            # 保护单改由 Monitor 在收到成交事件后按真实持仓数量创建（见 monitor._ensure_protection）。
             await self.database.execute("UPDATE commands SET trade_id=?,status='EXECUTED' WHERE command_id=?",
                                         (trade_id, command.command_id))
             await self.states.transition(trade_id, TradeState.PENDING_ENTRY)
             await self.database.audit("PLACE_ENTRY", trade_id, "SUCCESS", after=result.raw)
         except Exception as exc:
             if entry_accepted and result is not None:
-                # 保护单创建失败时优先撤掉刚受理的进场，避免留下无保护的潜在仓位；无论撤单结果如何均锁定人工处理。
+                # 进场已受理但后续步骤失败时，优先撤掉刚受理的进场，避免留下无保护的潜在仓位；
+                # 无论撤单结果如何均锁定人工处理。
                 try:
                     await self._cancel_pending_protection(trade_id, adapter)
                     await adapter.cancel_order(result.exchange_order_id)
                     await self.database.execute("UPDATE orders SET status='CANCELED' WHERE client_order_id=?", (client_id,))
                 except Exception as cleanup_exc:
                     await self.database.audit("PENDING_PROTECTION_CLEANUP", trade_id, f"FAILED: {cleanup_exc}")
-                await self.states.lock(trade_id, f"Binance 预挂保护单失败：{exc}")
+                await self.states.lock(trade_id, f"{command.exchange.value} 进场受理后处理失败：{exc}")
             else:
                 await self.database.execute("UPDATE orders SET status='REJECTED' WHERE client_order_id=?", (client_id,))
                 await self.states.transition(trade_id, TradeState.REJECTED)
@@ -349,31 +354,25 @@ class TradingService:
             await self.database.audit("PLACE_ENTRY", trade_id, f"FAILED: {exc}")
             raise
         note = "（公告未指定交易所，已使用本地默认值）" if command.exchange_defaulted else ""
-        return f"已提交 {trade_id} 进场挂单至 {command.exchange.value}{note}，订单号 {result.exchange_order_id}"
+        protection_note = self._protection_note(command, adapter)
+        return (
+            f"已提交 {trade_id} 进场挂单至 {command.exchange.value}{note}，"
+            f"订单号 {result.exchange_order_id}{protection_note}"
+        )
 
-    async def _place_binance_pending_protection(self, trade_id: str, command: TradeCommand,
-                                                 instrument, adapter) -> None:
-        """Binance 进场受理后立刻预挂全平止盈止损，成交后由监控按实际数量校准。"""
-        assert command.quantity is not None and command.stop_loss is not None
-        close_side = "SELL" if command.side == PositionSide.LONG else "BUY"
-        for order_type, price, place in (
-            ("TAKE_PROFIT", command.take_profits[-1], adapter.place_take_profit),
-            ("STOP_LOSS", command.stop_loss, adapter.place_stop_loss),
-        ):
-            request = OrderRequest(
-                instrument=instrument, position_side=command.side, order_side=close_side,
-                order_type="MARKET", quantity=command.quantity, price=price, reduce_only=True,
-                client_order_id=self._client_order_id(command, f"PENDING_{order_type}"),
-                close_position=True,
-            )
-            result = await place(request)
-            await self.database.execute(
-                "INSERT INTO orders(trade_id,exchange_order_id,client_order_id,order_type,price,quantity,status) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (trade_id, result.exchange_order_id, result.client_order_id, order_type,
-                 str(price), str(command.quantity), result.status.upper()),
-            )
-            await self.database.audit("PLACE_PENDING_PROTECTION", trade_id, "SUCCESS", after=result.raw)
+    @staticmethod
+    def _protection_note(command: TradeCommand, adapter) -> str:
+        """在回报中明确止盈止损参数与生效时机，避免把「成交后补建」误判为没有配置。"""
+        parts: list[str] = []
+        targets = [str(tp) for tp in command.take_profits]
+        if targets:
+            parts.append("止盈 " + "/".join(targets))
+        if command.stop_loss is not None:
+            parts.append(f"止损 {command.stop_loss}")
+        if not parts:
+            return ""
+        timing = "已随进场单附带" if adapter.entry_protection_attached else "成交后自动补建"
+        return f"，{'，'.join(parts)}（{timing}）"
 
     @staticmethod
     def _client_order_id(command: TradeCommand, suffix: str) -> str:

@@ -127,15 +127,14 @@ class BinanceAdapter(ExchangeAdapter):
         return replace(self._result(await self._request("DELETE",path,{"symbol":symbol,key:oid},True)),status="CANCELED")
     async def _conditional(self,r,kind):
         r=self._normalize(r)
-        if (not r.reduce_only and not r.close_position) or r.price is None:
-            raise ExchangeError("Binance 保护单必须只减仓或使用全平模式，并提供触发价")
+        # 保护单一律使用「数量 + reduceOnly」：Binance 的 closePosition 全平模式在进场尚未成交时
+        # 会被服务端以 -4509（Time in Force GTE can only be used with open positions）拒绝，
+        # 且系统始终知道该交易的确切持仓数量，无需全平语义。
+        if not r.reduce_only or r.price is None:
+            raise ExchangeError("Binance 保护单必须只减仓并提供触发价")
         p={"algoType":"CONDITIONAL","symbol":r.instrument.exchange_symbol,"side":r.order_side,"type":kind,
-           "triggerPrice":_number(r.price),"workingType":"MARK_PRICE","clientAlgoId":r.client_order_id}
-        # 进场单尚未成交时，Binance 只能通过 closePosition 预挂保护单；不能同时传数量和 reduceOnly。
-        if r.close_position:
-            p["closePosition"]="true"
-        else:
-            p.update({"quantity":_number(r.quantity),"reduceOnly":"true"})
+           "triggerPrice":_number(r.price),"workingType":"MARK_PRICE","clientAlgoId":r.client_order_id,
+           "quantity":_number(r.quantity),"reduceOnly":"true"}
         return self._result(await self._request("POST","/fapi/v1/algoOrder",p,True),r.client_order_id)
     async def place_take_profit(self,r):return await self._conditional(r,"TAKE_PROFIT_MARKET")
     async def place_stop_loss(self,r):return await self._conditional(r,"STOP_MARKET")

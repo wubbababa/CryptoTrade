@@ -155,7 +155,6 @@ class OrderRequest:
     leverage: Decimal = Decimal("1")
     take_profit_price: Decimal | None = None  # 开仓附带止盈触发价（Mark 市价触发）
     stop_loss_price: Decimal | None = None    # 开仓附带止损触发价（Mark 市价触发）
-    close_position: bool = False              # 条件单触发时按交易所当前同向仓位全平
 
 
 @dataclass(frozen=True, slots=True)
