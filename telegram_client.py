@@ -37,6 +37,8 @@ class TelegramClient:
         self.running = True
 
     async def start(self) -> None:
+        if self.session is not None and not self.session.closed:
+            return
         if not self.token:
             raise RuntimeError("Telegram 已启用但缺少 TELEGRAM_BOT_TOKEN")
         if self.source_chat_id is None:
@@ -92,10 +94,13 @@ class TelegramClient:
         if target is None or self.session is None:
             logger.info("Telegram 回报：%s", text)
             return
-        async with self.session.post(f"{self.base_url}/sendMessage", json={"chat_id": target, "text": text}) as response:
-            payload = await response.json()
-            if not payload.get("ok"):
-                logger.error("发送 Telegram 回报失败：%s", payload.get("description"))
+        try:
+            async with self.session.post(f"{self.base_url}/sendMessage", json={"chat_id": target, "text": text}) as response:
+                payload = await response.json()
+                if not payload.get("ok"):
+                    logger.error("发送 Telegram 回报失败：%s", payload.get("description"))
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.error("发送 Telegram 回报时网络失败：%s", exc)
 
     async def _save_offset(self) -> None:
         await self.database.execute(

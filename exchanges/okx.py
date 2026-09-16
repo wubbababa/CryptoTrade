@@ -8,6 +8,7 @@ from typing import AsyncIterator
 from urllib.parse import urlencode
 import aiohttp
 from exchanges.base import ExchangeAdapter, ExchangeError, round_step
+from exchanges.credentials import credentials
 from models import Exchange, Instrument, OrderRequest, OrderResult, PositionSide, PositionSnapshot
 
 logger = logging.getLogger(__name__)
@@ -29,10 +30,12 @@ class OKXAdapter(ExchangeAdapter):
         self.config = config
         self.mode = str(config.get("mode", "DEMO")).upper()
         self.demo = self.mode == "DEMO"
-        self.api_key, self.secret = os.getenv("OKX_API_KEY", ""), os.getenv("OKX_API_SECRET", "")
-        self.passphrase = os.getenv("OKX_API_PASSPHRASE", "")
-        if not all((self.api_key, self.secret, self.passphrase)):
-            raise ExchangeError("OKX 缺少 API Key、Secret 或 Passphrase")
+        try:
+            self.api_key, self.secret, self.passphrase = credentials(
+                "OKX", self.mode, "API_KEY", "API_SECRET", "API_PASSPHRASE",
+            )
+        except ValueError as exc:
+            raise ExchangeError(str(exc)) from exc
         self.rest_base = str(config.get("rest_base", "https://www.okx.com")).rstrip("/")
         ws_host = "wss://wspap.okx.com:8443" if self.demo else "wss://ws.okx.com:8443"
         self.private_ws = str(config.get("private_ws", ws_host + "/ws/v5/private"))

@@ -14,6 +14,7 @@ from deepseek_parser import DeepSeekParser
 from dev_runner import run_dev_test
 from exchange_router import ExchangeRouter
 from monitor import Monitor
+from notifications import EventNotifier
 from settings import Settings
 from telegram_client import TelegramClient
 from trading_service import TradingService
@@ -27,32 +28,41 @@ class Application:
         self.database = Database(settings.database_path)
         self.database.initialize()
         self.router = ExchangeRouter(settings)
-        self.monitor = Monitor(self.router, self.database)
         # 默认使用 DeepSeek API 解析器进行 Telegram 自然语言交易信号识别
         self.parser = DeepSeekParser(settings)
         self.service = TradingService(settings, self.database, self.router)
         self.telegram = TelegramClient(settings.raw.get("telegram", {}), self.database)
+        self.notifier = EventNotifier(self.database, self.telegram, settings.raw.get("notifications", {}))
+        self.monitor = Monitor(self.router, self.database, self.notifier)
         self.stop_event = asyncio.Event()
         self.monitor_tasks: list[asyncio.Task] = []
+        self.command_tasks: set[asyncio.Task] = set()
 
     async def run(self) -> None:
         if not self.router.adapters:
             raise RuntimeError("没有可用交易所；请检查官方测试环境 API 凭据和 mode 配置")
+        telegram_enabled = self.settings.raw.get("telegram", {}).get("enabled", False)
+        if telegram_enabled:
+            # 先初始化回报通道，使启动对账故障也能及时通知。
+            await self.telegram.start()
         warnings = await self.monitor.reconcile()
         for warning in warnings:
             logger.critical(warning)
+            await self.notifier.emit("WARNING", "STARTUP_RECONCILE", warning)
         if not self.router.adapters:
             raise RuntimeError("所有交易所均在启动对账中失败，系统已停止，未接收 Telegram 指令")
         self.monitor_tasks = self.monitor.tasks()
-        if not self.settings.raw.get("telegram", {}).get("enabled", False):
+        if not telegram_enabled:
             logger.warning("Telegram 未启用；系统仅完成启动对账。按 Ctrl+C 退出。")
             await self.stop_event.wait()
             return
-        await self.telegram.start()
+        await self.notifier.emit("INFO", "STARTED", f"启动对账完成，已启用交易所：{', '.join(e.value for e in self.router.adapters)}")
         async for message in self.telegram.messages():
             if self.stop_event.is_set():
                 break
-            asyncio.create_task(self._handle_message(message), name=f"tg-{message.chat_id}-{message.message_id}")
+            task = asyncio.create_task(self._handle_message(message), name=f"tg-{message.chat_id}-{message.message_id}")
+            self.command_tasks.add(task)
+            task.add_done_callback(self.command_tasks.discard)
 
     async def _handle_message(self, message) -> None:
         # 先以主键去重，确保同一消息不会重复下单。
@@ -77,11 +87,16 @@ class Application:
             await self.database.audit("COMMAND_REJECTED", command_id, str(exc))
             logger.exception("处理消息失败")
         # 来源频道通常不允许 Bot 发言；执行回报使用独立目标，未配置时仅写日志。
-        await self.telegram.report(report)
+        level = "ERROR" if report.startswith("拒绝执行") else "INFO"
+        await self.notifier.emit(level, "COMMAND_RESULT", report, command_id)
 
     async def shutdown(self) -> None:
         logger.warning("正在停止接收新指令；交易所端现有订单不会撤销。")
+        await self.notifier.emit("WARNING", "STOPPING", "正在停止接收新指令；交易所端现有订单不会撤销。")
         self.stop_event.set()
+        # 已接收的指令先完成，避免关闭交易所连接时中断正在执行的下单/改单。
+        if self.command_tasks:
+            await asyncio.gather(*self.command_tasks, return_exceptions=True)
         await self.telegram.close()
         for task in self.monitor_tasks:
             task.cancel()
@@ -125,4 +140,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

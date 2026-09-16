@@ -33,8 +33,8 @@ class CommandValidator:
             errors.append("公告存在歧义：" + "、".join(command.ambiguities))
         if command.command_type == CommandType.OPEN_POSITION:
             self._validate_open(command, errors)
-        elif not command.trade_id:
-            errors.append("修改类指令必须包含唯一交易编号")
+        else:
+            self._validate_amendment(command, errors)
         if errors:
             raise ValidationError(errors)
 
@@ -60,3 +60,12 @@ class CommandValidator:
                 errors.append("空单止损必须高于进场区间")
             if any(tp >= reference for tp in command.take_profits):
                 errors.append("空单止盈必须低于进场价")
+
+    @staticmethod
+    def _validate_amendment(command: TradeCommand, errors: list[str]) -> None:
+        if not command.trade_id:
+            errors.append("修改类指令必须包含唯一交易编号")
+        if command.command_type == CommandType.AMEND_ENTRY and command.entry is None:
+            errors.append("改进场指令必须包含新的进场价格")
+        if command.command_type == CommandType.MOVE_STOP and command.stop_loss is not None and command.stop_loss <= 0:
+            errors.append("止损价格必须大于零")

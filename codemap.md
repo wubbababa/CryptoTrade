@@ -30,6 +30,9 @@ flowchart TD
     L[Monitor 监控与对账引擎] -->|周期对账与价格轮询| J
     L -->|根据行情计算| M[BreakevenStrategy 动态保本策略]
     M -->|达到保本条件时更新止损| J
+    F -->|命令结果| N[EventNotifier]
+    L -->|对账/保本/故障| N
+    N -->|审计、JSONL、Telegram| O[运行回报]
 ```
 
 ---
@@ -43,7 +46,9 @@ flowchart TD
 | [`main.py`](file:///f:/projects/CryptoTrade/main.py) | `Application`, `async_main`, `main` | **程序主入口**：负责初始化数据库、多交易所路由、监控器、DeepSeek 解析器与 Telegram 客户端；支持 `--dev` 开发测试参数；捕获退出信号并优雅停机。 |
 | [`dev_runner.py`](file:///f:/projects/CryptoTrade/dev_runner.py) | `run_dev_test` | **开发者测试套件**：支持通过 `python main.py --dev` 调试 DeepSeek API 连通性、打印原始返回与结构化实体，并端到端完成本地模拟开仓。 |
 | [`settings.py`](file:///f:/projects/CryptoTrade/settings.py) | `Settings`, `_load_dotenv` | **配置管理与密钥隔离**：轻量读取 `.env` 环境变量与 `config.yaml` 配置文件，提供强类型配置属性访问。 |
+| [`exchanges/credentials.py`](file:///f:/projects/CryptoTrade/exchanges/credentials.py) | `credentials` | **环境凭据隔离**：严格按交易所模式读取 `*_DEMO_*`、`*_TESTNET_*` 或 `*_LIVE_*` 变量，允许同一 `.env` 保存两套凭据而不混用。 |
 | [`app_logging.py`](file:///f:/projects/CryptoTrade/app_logging.py) | `configure_logging`, `JsonlFormatter` | **结构化日志系统**：配置控制台与文件日志输出，记录结构化 JSONL 运行轨迹。 |
+| [`notifications.py`](file:///f:/projects/CryptoTrade/notifications.py) | `EventNotifier` | **运行通知中心**：将启动对账、命令结果、保本和保护单故障同步写入审计日志、JSONL 与 Telegram 回报。 |
 
 ---
 
@@ -61,7 +66,7 @@ flowchart TD
 
 | 文件 | 核心类 / 函数 | 职责与功能说明 |
 | :--- | :--- | :--- |
-| [`trading_service.py`](file:///f:/projects/CryptoTrade/trading_service.py) | `TradingService` | **交易用例编排层**：负责指令幂等落库、账户权益获取、动态名义仓位计算、风险检查、进场限价挂单（自动附带第一止盈与止损）、状态迁移及全流程审计记录。 |
+| [`trading_service.py`](file:///f:/projects/CryptoTrade/trading_service.py) | `TradingService` | **交易用例编排层**：负责指令幂等落库、账户权益获取、动态名义仓位计算、风险检查、进场限价挂单，以及基于 `trade_id` 远端核对的改挂单、撤单、止损恢复和市价平仓。 |
 | [`position_sizer.py`](file:///f:/projects/CryptoTrade/position_sizer.py) | `PositionSizer` | **资金管理与仓位计算**：根据配置的保证金比例（默认账户权益 2%）与杠杆倍数（默认 100x）计算实际开仓标的数量。 |
 | [`risk_manager.py`](file:///f:/projects/CryptoTrade/risk_manager.py) | `RiskManager`, `RiskExceededError` | **风控检查**：对指令名义价值进行上限校验（如不得超过账户权益的 2 倍），超出即熔断拒绝。 |
 | [`breakeven_strategy.py`](file:///f:/projects/CryptoTrade/breakeven_strategy.py) | `calculate_breakeven`, `should_trigger`, `stop_only_improves` | **动态保本策略计算**：计算盈利进度达 50%（或自定义比例）时的触发价格，并将止损单动态抬升/下移至进场价上方 1% 处锁定利润。 |
@@ -85,7 +90,7 @@ flowchart TD
 
 | 文件 | 核心类 / 函数 | 职责与功能说明 |
 | :--- | :--- | :--- |
-| [`monitor.py`](file:///f:/projects/CryptoTrade/monitor.py) | `Monitor` | **后台监控与启动对账引擎**：系统启动时执行本地持仓与交易所官方仓位对账；启动后周期性轮询市场行情并触发动态保本策略。 |
+| [`monitor.py`](file:///f:/projects/CryptoTrade/monitor.py) | `Monitor` | **后台监控与启动对账引擎**：系统启动时按数量精确关联本地交易与远程仓位并恢复可监控交易；消费订单/行情事件，触发动态保本与保护单故障通知。 |
 | [`telegram_client.py`](file:///f:/projects/CryptoTrade/telegram_client.py) | `TelegramClient` | **Telegram 接口交互**：使用 Telegram Bot API 长轮询接收频道/群组新消息，支持发送交易执行结果回报。 |
 | [`database.py`](file:///f:/projects/CryptoTrade/database.py) | `Database` | **SQLite 数据持久化**：启用 WAL 模式和外键约束，管理消息、交易实例、订单、持仓快照、指令与审计日志表。 |
 
@@ -107,7 +112,7 @@ flowchart TD
 ```
 telegram_messages   -- Telegram 原始消息记录与解析缓存（以 chat_id, message_id 为主键去重）
 trade_instances     -- 交易生命周期实例表（记录 trade_id, 状态, 是否触发保本）
-orders              -- 订单明细表（记录交易所 order_id, client_order_id, 价格, 数量, 状态）
+orders              -- 订单明细表（记录交易所 order_id、委托数量、累计实际成交量、成交均价和状态）
 positions           -- 持仓快照表（用于启动对账与持仓监控）
 commands            -- 指令幂等执行表（记录 command_id, 状态, 载荷 JSON）
 exchange_events     -- 交易所事件日志表
@@ -126,6 +131,12 @@ telegram:
   enabled: true
   poll_timeout_seconds: 30
   report_chat_id: null
+
+notifications:
+  enabled: true
+  send_info: true
+  send_warnings: true
+  send_critical: true
 
 # 默认使用 DeepSeek API 进行自然语言交易公告解析
 deepseek:
@@ -160,9 +171,9 @@ exchanges:
 - `DEEPSEEK_API_KEY`: DeepSeek 官方 API 密钥（**优先推荐**）。
 - `TELEGRAM_BOT_TOKEN`: 用于接收公告和发送回报的 Telegram Bot Token。
 - `ALLOW_LIVE_TRADING`: 实盘保护总开关（必须显式设为 `true` 才能以 `LIVE` 模式启动）。
-- `OKX_API_KEY`, `OKX_SECRET_KEY`, `OKX_PASSPHRASE`: OKX 模拟盘/实盘凭据。
-- `BINANCE_API_KEY`, `BINANCE_SECRET_KEY`: Binance 测试网/实盘凭据。
-- `GATE_API_KEY`, `GATE_SECRET_KEY`: Gate 测试网/实盘凭据。
+- `OKX_DEMO_API_KEY` / `OKX_LIVE_API_KEY`（及对应 Secret、Passphrase）：OKX 模拟盘/实盘凭据。
+- `BINANCE_TESTNET_API_KEY` / `BINANCE_LIVE_API_KEY`（及对应 Secret）：Binance 测试网/实盘凭据。
+- `GATE_TESTNET_API_KEY` / `GATE_LIVE_API_KEY`（及对应 Secret）：Gate 测试网/实盘凭据。
 
 ---
 
@@ -181,6 +192,8 @@ py -m pytest
 - [`tests/test_dev_runner.py`](file:///f:/projects/CryptoTrade/tests/test_dev_runner.py)：开发者测试模式（`--dev`）端到端模拟下单与输出断言测试。
 - [`tests/test_okx_errors.py`](file:///f:/projects/CryptoTrade/tests/test_okx_errors.py)：交易所错误码处理与网络重试逻辑测试。
 - [`tests/test_telegram_config.py`](file:///f:/projects/CryptoTrade/tests/test_telegram_config.py)：Telegram 配置加载与消息解析验证。
+- [`tests/test_credentials.py`](file:///f:/projects/CryptoTrade/tests/test_credentials.py)：模拟盘与实盘凭据严格隔离测试。
+- [`tests/test_notifications.py`](file:///f:/projects/CryptoTrade/tests/test_notifications.py)：通知审计、级别开关和 Telegram 回报格式测试。
 
 ---
 
@@ -189,9 +202,11 @@ py -m pytest
 以下能力尚未完成或尚未接通，按风险优先级维护：
 
 1. **自动保本策略执行**：已接入 OKX、Binance、Gate 行情事件；对于本地已跟踪的止损单，达到目标进度后会按真实持仓均价创建更优止损、撤销旧止损，并持久化 `breakeven_triggered`。旧版 OKX 原子附带保护单尚未保存可撤销的 Algo ID，因此不会猜测并修改该类订单。
-2. **启动后的完整持仓恢复**：启动对账会刷新快照和报告差异，但不会将历史持仓恢复为可继续保本监控的交易实例。
-3. **多笔同币种交易的精确关联**：后续操作仍需补齐“交易所 + 合约 + 方向 + trade_id”的完整远端核对，防止多笔持仓时误操作。
-4. **修改类 Telegram 指令（最后开发）**：`AMEND_ENTRY`、`CANCEL_ORDER`、`CLOSE_POSITION`、`MOVE_STOP` 目前由 `TradingService` 安全拒绝；后续再实现改挂单、改止盈止损、取消止损、补仓和人工保本，并且每次执行前必须远端复核。
+2. **启动后的持仓恢复**：启动对账会刷新仓位快照，并且仅在“交易所 + 合约 + 方向”下本地进场数量之和与远程仓位精确一致、且没有仍开放的进场单时恢复为 `OPEN`、补建非原子保护单及继续保本监控；未关联或数量不一致的远程持仓只告警，绝不猜测归属。跨设备/清库后的历史订单重建仍未实现。
+3. **多笔同币种交易的精确关联**：已以本地 `trade_id` 的进场数量作为汇总仓位分配账本；自动保本仅在同一“交易所 + 合约 + 方向”下所有活动交易的数量之和与远程仓位精确一致时逐笔执行，否则记录审计并停止自动操作。跨设备/人工交易导致的数量差异仍需人工处置。
+4. **人工 Telegram 指令**：已开放 `AMEND_ENTRY`（仅未成交挂单）、`CANCEL_ORDER`（未成交时撤进场、已开仓时取消止损）、`MOVE_STOP`（改止损或恢复止损）与明确的 `CLOSE_POSITION` 市价平仓。每项均要求完整 `trade_id`，并核对交易所、合约、方向和远程订单/仓位；不能唯一关联则拒绝。修改止盈、补仓及“保本离场”改止盈仍待实现。
+5. **通知与可观测性**：已将启动对账、命令结果、保本移动、保护单失败和停机事件写入 SQLite 审计、JSONL 日志并按级别发送 Telegram 回报；尚未提供审计查询 CLI 或周期性运行摘要。
+6. **成交与事件安全性**：部分成交使用交易所累计成交量创建并随成交扩大而替换保护单；部分成交时拒绝撤余单；行情 ticker 不再逐条写入 SQLite；关闭时会等待已接收的 Telegram 指令完成。OKX 原子附带保护单的 Algo ID 查询/撤销关联仍待补齐，相关人工操作会安全拒绝。
 
 解析器文档已统一：`DeepSeekParser` 是默认运行链路，`codex_parser.py` 仅作为停用的备用实现保留。
 

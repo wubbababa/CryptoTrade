@@ -3,7 +3,9 @@
 这是 `CryptoTrade.md` 的安全第一版实现：Telegram Bot 长轮询接收公告，默认由 DeepSeek API
 输出结构化指令，确定性校验与风险模块审批后，路由到 OKX、Binance 或 Gate 的独立适配器。
 
-当前默认连接 OKX 官方模拟盘、Binance 官方测试网和 Gate 官方测试网。三个适配器封装了各自
+当前默认连接 OKX 官方模拟盘、Binance 官方测试网和 Gate 官方测试网。`.env` 可同时保存模拟盘和实盘
+凭据：程序严格根据 `config.yaml` 的模式读取对应环境变量，例如 `OKX_DEMO_API_KEY` 或
+`OKX_LIVE_API_KEY`，不会读取无环境后缀的旧变量。三个适配器封装了各自
 的签名、合约代码、价格精度、数量单位、账户/订单 REST 接口和私有 WebSocket 事件流。
 
 ## 启动
@@ -23,6 +25,10 @@ python main.py
 默认 `telegram.enabled: true`；未配置有效 Bot Token 时无法接收公告。接入 Telegram 时，在 `.env` 填入 Bot
 Token，并在 `.env` 配置来源 Chat ID。首次启动会丢弃历史积压，
 只处理启动后消息。
+
+系统会将启动对账、指令执行结果、自动保本和保护单故障写入 JSONL 与 SQLite 审计日志，并发送到
+`TELEGRAM_REPORT_CHAT_ID`。`config.yaml` 的 `notifications` 可分别关闭普通信息、告警或严重告警通知；
+通知不包含 API Key、Secret 或原始请求签名。
 
 私密来源频道必须把 Bot 加为管理员，并在 `.env` 配置 `TELEGRAM_SOURCE_CHAT_ID`。获取 ID：
 
@@ -74,5 +80,5 @@ pytest
 - API 密钥只从环境变量读取，`.env` 已被 Git 忽略；日志不记录密钥。
 - 所有价格和数量使用 `Decimal`；自然语言输出必须再次通过确定性校验。
 - Telegram 消息、指令和客户端订单号三层幂等。
-- 修改类指令当前安全拒绝，避免在尚未完成真实账户对账前误改订单。
+- Telegram 人工指令必须包含完整 `trade_id`，且会先核对交易所、合约、方向和远程订单。已支持改未成交挂单、取消进场挂单、取消/恢复止损及明确的市价平仓；无法唯一关联时安全拒绝。
 - 退出不会撤单或平仓，并会明确提示本地动态监控已停止。

@@ -7,6 +7,7 @@ from typing import AsyncIterator
 from urllib.parse import urlencode
 import aiohttp
 from exchanges.base import ExchangeAdapter, ExchangeError, round_step
+from exchanges.credentials import credentials
 from models import Exchange, Instrument, OrderRequest, OrderResult, PositionSide, PositionSnapshot
 
 logger=logging.getLogger(__name__)
@@ -15,8 +16,8 @@ def _number(v:Decimal)->str:return format(v,"f")
 class GateAdapter(ExchangeAdapter):
     def __init__(self,config:dict)->None:
         self.config,self.mode=config,str(config.get("mode","TESTNET")).upper();self.testnet=self.mode=="TESTNET"
-        self.api_key,self.secret=os.getenv("GATE_API_KEY",""),os.getenv("GATE_API_SECRET","")
-        if not self.api_key or not self.secret:raise ExchangeError("Gate 缺少 API Key 或 Secret")
+        try:self.api_key,self.secret=credentials("GATE",self.mode,"API_KEY","API_SECRET")
+        except ValueError as exc:raise ExchangeError(str(exc)) from exc
         self.rest_base=str(config.get("rest_base","https://api-testnet.gateapi.io/api/v4" if self.testnet else "https://api.gateio.ws/api/v4")).rstrip("/")
         self.ws_url=str(config.get("private_ws","wss://ws-testnet.gate.com/v4/ws/futures/usdt" if self.testnet else "wss://fx-ws.gateio.ws/v4/ws/usdt"))
         self.session:aiohttp.ClientSession|None=None;self.instruments={};self.order_symbols={};self._closed=False

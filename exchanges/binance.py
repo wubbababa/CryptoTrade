@@ -7,6 +7,7 @@ from typing import AsyncIterator
 from urllib.parse import urlencode
 import aiohttp
 from exchanges.base import ExchangeAdapter, ExchangeError, round_step
+from exchanges.credentials import credentials
 from models import Exchange, Instrument, OrderRequest, OrderResult, PositionSide, PositionSnapshot
 
 logger = logging.getLogger(__name__)
@@ -16,8 +17,10 @@ class BinanceAdapter(ExchangeAdapter):
     def __init__(self, config: dict) -> None:
         self.config, self.mode = config, str(config.get("mode", "TESTNET")).upper()
         self.testnet = self.mode == "TESTNET"
-        self.api_key, self.secret = os.getenv("BINANCE_API_KEY", ""), os.getenv("BINANCE_API_SECRET", "")
-        if not self.api_key or not self.secret: raise ExchangeError("Binance 缺少 API Key 或 Secret")
+        try:
+            self.api_key, self.secret = credentials("BINANCE", self.mode, "API_KEY", "API_SECRET")
+        except ValueError as exc:
+            raise ExchangeError(str(exc)) from exc
         self.rest_base = str(config.get("rest_base", "https://demo-fapi.binance.com" if self.testnet else "https://fapi.binance.com")).rstrip("/")
         self.ws_base = str(config.get("ws_base", "wss://fstream.binancefuture.com" if self.testnet else "wss://fstream.binance.com")).rstrip("/")
         self.session: aiohttp.ClientSession | None = None

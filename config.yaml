@@ -3,6 +3,12 @@ telegram:
   poll_timeout_seconds: 30
   report_chat_id: null
 
+notifications:
+  enabled: true
+  send_info: true
+  send_warnings: true
+  send_critical: true
+
 # 默认使用 DeepSeek API 进行自然语言交易公告结构化解析
 deepseek:
   # API 密钥优先从系统环境变量 DEEPSEEK_API_KEY 读取，也可在此配置

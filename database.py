@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS trade_instances (
 CREATE TABLE IF NOT EXISTS orders (
   id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id TEXT NOT NULL, exchange_order_id TEXT,
   client_order_id TEXT NOT NULL UNIQUE, order_type TEXT NOT NULL, price TEXT,
-  quantity TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  quantity TEXT NOT NULL, filled_quantity TEXT NOT NULL DEFAULT '0', average_fill_price TEXT,
+  status TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS positions (
   exchange TEXT NOT NULL, instrument_key TEXT NOT NULL, side TEXT NOT NULL,
@@ -59,6 +60,12 @@ class Database:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.executescript(SCHEMA)
+            # 为既有数据库添加成交事实字段，避免升级时丢失历史订单。
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(orders)")}
+            if "filled_quantity" not in columns:
+                conn.execute("ALTER TABLE orders ADD COLUMN filled_quantity TEXT NOT NULL DEFAULT '0'")
+            if "average_fill_price" not in columns:
+                conn.execute("ALTER TABLE orders ADD COLUMN average_fill_price TEXT")
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -97,4 +104,3 @@ class Database:
 
 def _json(value: Any) -> str | None:
     return None if value is None else json.dumps(value, ensure_ascii=False, default=str)
-
