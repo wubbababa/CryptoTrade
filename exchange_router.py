@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 class ExchangeRouter:
     def __init__(self, settings: Settings) -> None:
         self.adapters: dict[Exchange, ExchangeAdapter] = {}
+        # 保存初始化失败原因，供默认广播执行和启动报告准确说明跳过原因。
+        self.unavailable_reasons: dict[Exchange, str] = {}
         factories = {Exchange.OKX: OKXAdapter, Exchange.BINANCE: BinanceAdapter, Exchange.GATE: GateAdapter}
         for exchange in settings.enabled_exchanges():
             cfg = settings.exchange_config(exchange)
@@ -31,6 +33,7 @@ class ExchangeRouter:
             except ExchangeError as exc:
                 # 单家连接配置失败时单独禁用，不阻断其他交易所监控。
                 logger.error("已禁用 %s：%s", exchange.value, exc)
+                self.unavailable_reasons[exchange] = str(exc)
 
     def get(self, exchange: Exchange) -> ExchangeAdapter:
         try:
@@ -63,4 +66,3 @@ def _local_adapter(exchange: Exchange, config: dict) -> PaperAdapter:
         for asset in raw_assets
     }
     return PaperAdapter(instruments, Decimal(str(config.get("paper_equity_usdt", "10000"))))
-

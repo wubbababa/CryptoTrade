@@ -22,6 +22,8 @@ class TelegramMessage:
     message_id: int
     text: str
     received_at: str
+    # 是否来自配置的交易公告来源频道；命令来源（如私聊）为 False。
+    is_source: bool = False
 
 
 class TelegramClient:
@@ -31,6 +33,12 @@ class TelegramClient:
         self.token = os.getenv("TELEGRAM_BOT_TOKEN", "")
         self.source_chat_id = _optional_chat_id(os.getenv("TELEGRAM_SOURCE_CHAT_ID", ""))
         self.report_chat_id = _optional_chat_id(os.getenv("TELEGRAM_REPORT_CHAT_ID", ""))
+        # 允许发送 /start、/status 等只读命令的聊天；不配置时仅来源频道可用。
+        raw_command_chats = (
+            os.getenv("TELEGRAM_COMMAND_CHAT_IDS", "") or os.getenv("TELEGRAM_ADMIN_CHAT_ID", "")
+        )
+        self.command_chat_ids = _optional_chat_id_list(raw_command_chats)
+        self.bot_username: str | None = None
         self.base_url = f"https://api.telegram.org/bot{self.token}"
         self.session: aiohttp.ClientSession | None = None
         self.offset: int | None = None
@@ -47,6 +55,7 @@ class TelegramClient:
                 "请先运行 python tools/get_telegram_chat_id.py 获取"
             )
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45))
+        await self._load_bot_username()
         rows = await self.database.fetch_all("SELECT value FROM runtime_state WHERE key='telegram_offset'")
         if rows:
             self.offset = int(rows[0]["value"])
@@ -56,11 +65,24 @@ class TelegramClient:
             self.offset = (updates[-1]["update_id"] + 1) if updates else 0
             await self._save_offset()
 
+    async def _load_bot_username(self) -> None:
+        """获取 Bot 用户名，用于识别 /status@本机器人 这类命令。"""
+        try:
+            async with self.session.get(f"{self.base_url}/getMe") as response:
+                payload = await response.json()
+            if payload.get("ok"):
+                self.bot_username = payload["result"].get("username")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            # 用户名只影响 @机器人 后缀的命令，失败不阻断启动。
+            logger.warning("获取 Bot 用户名失败：%s", exc)
+
     async def messages(self) -> AsyncIterator[TelegramMessage]:
         if self.session is None:
             await self.start()
-        # 只接收明确配置的来源频道，避免其他聊天消息触发交易。
+        # 来源频道：所有文本都可能是交易公告。
+        # 命令聊天（如管理员私聊）：只接收 / 开头的文本，不解析为交易公告。
         allowed = {self.source_chat_id}
+        command_allowed = set(self.command_chat_ids)
         while self.running:
             try:
                 updates = await self._get_updates(self.offset, int(self.config.get("poll_timeout_seconds", 30)))
@@ -71,18 +93,26 @@ class TelegramClient:
                     if not message or not message.get("text"):
                         continue
                     chat_id = int(message["chat"]["id"])
-                    if allowed and chat_id not in allowed:
-                        continue
+                    is_source = allowed and chat_id in allowed
+                    if not is_source:
+                        # 非来源频道仅在显式允许且是命令时才放行。
+                        if chat_id not in command_allowed or not message["text"].strip().startswith("/"):
+                            continue
                     yield TelegramMessage(update["update_id"], chat_id, int(message["message_id"]),
-                                          message["text"], str(message.get("date", "")))
+                                          message["text"], str(message.get("date", "")), is_source)
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 logger.warning("Telegram 轮询暂时失败：%s", exc)
                 await asyncio.sleep(3)
+            except RuntimeError as exc:
+                # Telegram 返回非 ok（例如残留 webhook 导致 409）时退避重试，不终止整个程序。
+                logger.error("Telegram 轮询被拒绝：%s", exc)
+                await asyncio.sleep(5)
 
     async def _get_updates(self, offset: int | None, timeout: int) -> list[dict]:
         assert self.session is not None
         async with self.session.get(f"{self.base_url}/getUpdates", params={
-            "offset": offset, "timeout": timeout, "allowed_updates": '["message","channel_post"]',
+            "offset": offset, "timeout": timeout,
+            "allowed_updates": '["message","channel_post","edited_channel_post"]',
         }) as response:
             payload = await response.json()
             if not payload.get("ok"):
@@ -101,6 +131,21 @@ class TelegramClient:
                     logger.error("发送 Telegram 回报失败：%s", payload.get("description"))
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             logger.error("发送 Telegram 回报时网络失败：%s", exc)
+
+    async def reply(self, chat_id: int, text: str) -> None:
+        """把命令回复发回请求所在的聊天；未配置回报目标也照常发送。"""
+        if self.session is None:
+            logger.info("Telegram 回复（未发送）：%s", text)
+            return
+        try:
+            async with self.session.post(f"{self.base_url}/sendMessage",
+                                         json={"chat_id": chat_id, "text": _truncate_for_telegram(text)}) as response:
+                payload = await response.json()
+                if not payload.get("ok"):
+                    # 频道里 Bot 无发言权时退化为日志，避免命令处理因此失败。
+                    logger.error("发送 Telegram 回复失败：%s", payload.get("description"))
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.error("发送 Telegram 回复时网络失败：%s", exc)
 
     async def _save_offset(self) -> None:
         await self.database.execute(
@@ -129,3 +174,22 @@ def _optional_chat_id(value: str) -> int | str | None:
         return int(value)
     except ValueError as exc:
         raise RuntimeError("Telegram Chat ID 必须是 -100... 数字或 @公开用户名") from exc
+
+
+def _optional_chat_id_list(value: str) -> list[int | str]:
+    """解析逗号分隔的 Chat ID 列表；空白项忽略。"""
+    result: list[int | str] = []
+    for item in value.split(","):
+        if not item.strip():
+            continue
+        parsed = _optional_chat_id(item)
+        if parsed is not None and parsed not in result:
+            result.append(parsed)
+    return result
+
+
+def _truncate_for_telegram(text: str, limit: int = 4000) -> str:
+    """Telegram 单条消息上限 4096 字符，超出时安全截断。"""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 20] + "\n…（内容已截断）"

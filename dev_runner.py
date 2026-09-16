@@ -10,7 +10,7 @@ from typing import Any
 
 from database import Database
 from deepseek_parser import DeepSeekParser
-from exchange_router import ExchangeRouter, _local_adapter
+from exchange_router import ExchangeRouter
 from models import Exchange, TradeCommand
 from settings import Settings
 from trading_service import TradingService
@@ -40,7 +40,7 @@ async def run_dev_test(config_path: str = "config.yaml", custom_signal: str | No
     key_status = "[OK] 已加载 (" + api_key_source + ")" if settings.deepseek_api_key else "[!] 未检测到 Key"
     print(f"\n[1/4] 加载配置：")
     print(f"  - 配置文件: {config_path}")
-    print(f"  - 默认交易所: {settings.default_exchange.value}")
+    print(f"  - 默认交易所: {', '.join(item.value for item in settings.default_exchanges)}")
     print(f"  - DeepSeek 模型: {deepseek_cfg.get('model', 'deepseek-chat')}")
     print(f"  - DeepSeek Base URL: {deepseek_cfg.get('base_url', 'https://api.deepseek.com')}")
     print(f"  - API Key 状态: {key_status}")
@@ -50,11 +50,11 @@ async def run_dev_test(config_path: str = "config.yaml", custom_signal: str | No
     database.initialize()
     router = ExchangeRouter(settings)
 
-    # 如果没有配置真实的交易所 API 凭据，自动为默认交易所提供本地模拟适配器（PaperAdapter）以确保测试畅通
-    default_ex = settings.default_exchange
-    if default_ex not in router.adapters:
-        print(f"  - 提示: 交易所 {default_ex.value} 未配置有效远程凭据，已自动装载本地模拟撮合盘 (PaperAdapter)")
-        router.adapters[default_ex] = _local_adapter(default_ex, settings.exchange_config(default_ex))
+    # 开发模式不伪造远程交易所；缺少凭据的目标会由广播执行结果明确标记为跳过。
+    for exchange in settings.default_exchanges:
+        if exchange not in router.adapters:
+            reason = router.unavailable_reasons.get(exchange, "配置未启用或适配器未初始化")
+            print(f"  - 提示: {exchange.value} 将跳过：{reason}")
 
     # 3. 准备测试信号并调用 DeepSeek API
     signal_text = custom_signal.strip() if custom_signal else DEFAULT_SAMPLE_SIGNAL

@@ -39,7 +39,27 @@ class Settings:
 
     @property
     def default_exchange(self) -> Exchange:
-        return Exchange(self.raw["trading"]["default_exchange"].upper())
+        """兼容旧调用方：返回默认交易所列表中的第一个交易所。"""
+        return self.default_exchanges[0]
+
+    @property
+    def default_exchanges(self) -> tuple[Exchange, ...]:
+        """获取公告未指定交易所时的默认执行目标，兼容旧版单值配置。"""
+        trading = self.raw.get("trading", {})
+        configured = trading.get("default_exchanges")
+        if configured is None:
+            configured = [trading.get("default_exchange", "OKX")]
+        if isinstance(configured, str):
+            configured = [configured]
+        if not isinstance(configured, list) or not configured:
+            raise ValueError("trading.default_exchanges 必须是非空交易所列表")
+        try:
+            exchanges = tuple(Exchange(str(item).upper()) for item in configured)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("trading.default_exchanges 包含不支持的交易所") from exc
+        if len(set(exchanges)) != len(exchanges):
+            raise ValueError("trading.default_exchanges 不允许重复交易所")
+        return exchanges
 
     @property
     def whitelist(self) -> set[str]:

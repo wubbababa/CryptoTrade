@@ -17,6 +17,7 @@ from monitor import Monitor
 from notifications import EventNotifier
 from settings import Settings
 from telegram_client import TelegramClient
+from telegram_commands import TelegramCommandHandler, UnknownCommand, parse_command
 from trading_service import TradingService
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ class Application:
         self.parser = DeepSeekParser(settings)
         self.service = TradingService(settings, self.database, self.router)
         self.telegram = TelegramClient(settings.raw.get("telegram", {}), self.database)
+        self.command_handler = TelegramCommandHandler(self.database, self.router)
         self.notifier = EventNotifier(self.database, self.telegram, settings.raw.get("notifications", {}))
         self.monitor = Monitor(self.router, self.database, self.notifier)
         self.stop_event = asyncio.Event()
@@ -65,13 +67,17 @@ class Application:
             task.add_done_callback(self.command_tasks.discard)
 
     async def _handle_message(self, message) -> None:
-        # 先以主键去重，确保同一消息不会重复下单。
+        # 先以主键去重，确保同一消息不会重复下单或重复回复。
         inserted = await self.database.execute(
             "INSERT OR IGNORE INTO telegram_messages(chat_id,message_id,raw_text,received_at) VALUES(?,?,?,?)",
             (message.chat_id, message.message_id, message.text, message.received_at),
         )
         if inserted == 0:
             logger.info("忽略重复 Telegram 消息 %s/%s", message.chat_id, message.message_id)
+            return
+        # 命令层只做只读查询，回复发回原聊天，不进入交易解析。
+        if self._is_command(message):
+            await self._handle_command(message)
             return
         command_id = f"tg-{message.chat_id}-{message.message_id}"
         try:
@@ -89,6 +95,28 @@ class Application:
         # 来源频道通常不允许 Bot 发言；执行回报使用独立目标，未配置时仅写日志。
         level = "ERROR" if report.startswith("拒绝执行") else "INFO"
         await self.notifier.emit(level, "COMMAND_RESULT", report, command_id)
+
+    def _is_command(self, message) -> bool:
+        """来源频道的非命令文本按公告处理；命令聊天只接收 / 开头文本。"""
+        return parse_command(message.text, self.telegram.bot_username) is not None
+
+    async def _handle_command(self, message) -> None:
+        parsed = parse_command(message.text, self.telegram.bot_username)
+        assert parsed is not None
+        name, args = parsed
+        command_id = f"tg-{message.chat_id}-{message.message_id}"
+        try:
+            reply = await self.command_handler.execute(name, args)
+            await self.database.audit("TELEGRAM_COMMAND", command_id, f"OK: {name}")
+        except UnknownCommand:
+            reply = f"未知命令 /{name}。\n\n" + self.command_handler.help_text()
+            await self.database.audit("TELEGRAM_COMMAND", command_id, f"UNKNOWN: {name}")
+        except Exception as exc:
+            reply = f"命令 /{name} 执行失败：{exc}"
+            await self.database.audit("TELEGRAM_COMMAND", command_id, f"FAILED: {name}: {exc}")
+            logger.exception("处理 Telegram 命令失败")
+        # 命令回复直接发回原聊天（管理员私聊或来源频道），不经过配置的回报目标。
+        await self.telegram.reply(message.chat_id, reply)
 
     async def shutdown(self) -> None:
         logger.warning("正在停止接收新指令；交易所端现有订单不会撤销。")

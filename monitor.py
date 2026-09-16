@@ -206,7 +206,13 @@ class Monitor:
             if status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"} and current in {
                 TradeState.PENDING_ENTRY.value, TradeState.PARTIAL_FILL.value,
             }:
-                await self._set_state(trade_id, TradeState.CANCELLED)
+                try:
+                    await self._cancel_pending_protection(adapter, trade_id)
+                    await self._set_state(trade_id, TradeState.CANCELLED)
+                except Exception as exc:
+                    await self._set_state(trade_id, TradeState.ERROR_LOCKED, force=True)
+                    await self._notify("CRITICAL", "PENDING_PROTECTION_CLEANUP_FAILED",
+                                       f"进场撤销后预挂保护单清理失败：{exc}", trade_id)
             return
         try:
             await self._ensure_protection(exchange, adapter, trade_id)
@@ -461,6 +467,16 @@ class Monitor:
                  str(price), str(trade_quantity), result.status.upper()),
             )
             await self.database.audit("PLACE_PROTECTION", trade_id, "SUCCESS", after=result.raw)
+
+    async def _cancel_pending_protection(self, adapter, trade_id: str) -> None:
+        """进场撤销时清理 Binance 等交易所预挂的保护单。"""
+        rows = await self.database.fetch_all(
+            "SELECT id,exchange_order_id FROM orders WHERE trade_id=? AND order_type IN ('TAKE_PROFIT','STOP_LOSS') "
+            "AND status IN ('NEW','OPEN','PARTIALLY_FILLED')", (trade_id,),
+        )
+        for row in rows:
+            await adapter.cancel_order(row["exchange_order_id"])
+            await self.database.execute("UPDATE orders SET status='CANCELED' WHERE id=?", (row["id"],))
 
     async def _trade_quantity(self, trade_id: str) -> Decimal | None:
         """读取单笔交易的进场数量，作为远程汇总仓位的唯一分配依据。"""

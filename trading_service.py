@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 from dataclasses import asdict, replace
@@ -9,7 +10,7 @@ from decimal import Decimal
 
 from database import Database
 from exchange_router import ExchangeRouter
-from models import CommandType, OrderRequest, PositionSide, TradeCommand, TradeState
+from models import CommandType, Exchange, OrderRequest, PositionSide, TradeCommand, TradeState
 from risk_manager import RiskManager
 from position_sizer import PositionSizer
 from settings import Settings
@@ -28,6 +29,49 @@ class TradingService:
         self.states = StateManager(database)
 
     async def execute(self, command: TradeCommand) -> str:
+        """执行指令；未指定交易所的开仓公告会独立广播到默认目标。"""
+        if command.command_type == CommandType.OPEN_POSITION and command.exchange_defaulted:
+            return await self._execute_default_exchanges(command)
+        return await self._execute_single(command)
+
+    async def _execute_default_exchanges(self, command: TradeCommand) -> str:
+        """为每个可用默认交易所创建独立子指令，避免跨账户状态相互影响。"""
+        targets = self.settings.default_exchanges
+        executable: list[TradeCommand] = []
+        skipped: list[str] = []
+        enabled = set(self.settings.enabled_exchanges())
+        for exchange in targets:
+            if exchange not in enabled:
+                skipped.append(f"{exchange.value}（配置未启用）")
+            elif exchange not in self.router.adapters:
+                reason = self.router.unavailable_reasons.get(exchange, "适配器未成功初始化")
+                skipped.append(f"{exchange.value}（跳过：{reason}）")
+            else:
+                # 子指令 ID 稳定且含交易所，支持逐交易所幂等和审计追踪。
+                executable.append(replace(
+                    command,
+                    command_id=f"{command.command_id}-{exchange.value}",
+                    exchange=exchange,
+                    exchange_defaulted=False,
+                ))
+        if not executable:
+            detail = "；".join(skipped) or "没有可用目标"
+            raise ValueError(f"默认交易所均不可执行：{detail}")
+
+        results = await asyncio.gather(
+            *(self._execute_single(item) for item in executable), return_exceptions=True,
+        )
+        report_lines = ["公告未指定交易所，已按默认目标独立执行："]
+        for item, result in zip(executable, results):
+            if isinstance(result, Exception):
+                report_lines.append(f"- {item.exchange.value}: 失败：{result}")
+            else:
+                report_lines.append(f"- {item.exchange.value}: {result}")
+        report_lines.extend(f"- {item}" for item in skipped)
+        return "\n".join(report_lines)
+
+    async def _execute_single(self, command: TradeCommand) -> str:
+        """执行单一交易所指令，保留原有的校验、幂等和状态机行为。"""
         self.validator.validate(command)
         payload = json.dumps(asdict(command), ensure_ascii=False, default=str)
         inserted = await self.database.execute(
@@ -176,6 +220,9 @@ class TradingService:
             raise ValueError("进场单已部分成交；请先确认已创建保护单或使用明确平仓指令，拒绝撤余单")
         order_type = "ENTRY" if trade["state"] in {TradeState.PENDING_ENTRY.value, TradeState.PARTIAL_FILL.value} else "STOP_LOSS"
         local, remote = await self._remote_order(adapter, trade["trade_id"], order_type)
+        if order_type == "ENTRY":
+            # Binance 未成交进场可能已预挂全平保护单，撤进场前必须先清理，避免留下孤立条件单。
+            await self._cancel_pending_protection(trade["trade_id"], adapter)
         await adapter.cancel_order(remote.exchange_order_id)
         await self.database.execute("UPDATE orders SET status='CANCELED' WHERE id=?", (local["id"],))
         if order_type == "ENTRY":
@@ -186,6 +233,16 @@ class TradingService:
             report = f"{trade['trade_id']} 止损已取消，交易进入等待补仓/恢复止损状态"
         await self.database.audit("CANCEL_ORDER", trade["trade_id"], "SUCCESS", before={"order_type": order_type})
         return report
+
+    async def _cancel_pending_protection(self, trade_id: str, adapter) -> None:
+        """撤销未成交进场关联的预挂保护单，避免后续仓位被旧条件单误平。"""
+        rows = await self.database.fetch_all(
+            "SELECT id,exchange_order_id FROM orders WHERE trade_id=? AND order_type IN ('TAKE_PROFIT','STOP_LOSS') "
+            "AND status IN ('NEW','OPEN','PARTIALLY_FILLED')", (trade_id,),
+        )
+        for row in rows:
+            await adapter.cancel_order(row["exchange_order_id"])
+            await self.database.execute("UPDATE orders SET status='CANCELED' WHERE id=?", (row["id"],))
 
     async def _close_position(self, command: TradeCommand, trade: dict, adapter, instrument) -> str:
         if trade["state"] != TradeState.OPEN.value:
@@ -250,6 +307,8 @@ class TradingService:
             take_profit_price=tp_price,
             stop_loss_price=sl_price,
         )
+        entry_accepted = False
+        result = None
         try:
             # 先持久化可关联的客户订单号，再请求交易所，防止成交推送先于 HTTP 回包到达。
             await self.database.execute(
@@ -262,22 +321,59 @@ class TradingService:
                 (trade_id, command.command_id),
             )
             result = await adapter.place_entry_order(request)
+            entry_accepted = True
             await self.database.execute(
                 "UPDATE orders SET exchange_order_id=?,status=? WHERE client_order_id=?",
                 (result.exchange_order_id, result.status, client_id),
             )
+            if command.exchange == Exchange.BINANCE:
+                await self._place_binance_pending_protection(trade_id, command, instrument, adapter)
             await self.database.execute("UPDATE commands SET trade_id=?,status='EXECUTED' WHERE command_id=?",
                                         (trade_id, command.command_id))
             await self.states.transition(trade_id, TradeState.PENDING_ENTRY)
             await self.database.audit("PLACE_ENTRY", trade_id, "SUCCESS", after=result.raw)
         except Exception as exc:
-            await self.database.execute("UPDATE orders SET status='REJECTED' WHERE client_order_id=?", (client_id,))
+            if entry_accepted and result is not None:
+                # 保护单创建失败时优先撤掉刚受理的进场，避免留下无保护的潜在仓位；无论撤单结果如何均锁定人工处理。
+                try:
+                    await self._cancel_pending_protection(trade_id, adapter)
+                    await adapter.cancel_order(result.exchange_order_id)
+                    await self.database.execute("UPDATE orders SET status='CANCELED' WHERE client_order_id=?", (client_id,))
+                except Exception as cleanup_exc:
+                    await self.database.audit("PENDING_PROTECTION_CLEANUP", trade_id, f"FAILED: {cleanup_exc}")
+                await self.states.lock(trade_id, f"Binance 预挂保护单失败：{exc}")
+            else:
+                await self.database.execute("UPDATE orders SET status='REJECTED' WHERE client_order_id=?", (client_id,))
+                await self.states.transition(trade_id, TradeState.REJECTED)
             await self.database.execute("UPDATE commands SET status='REJECTED' WHERE command_id=?", (command.command_id,))
-            await self.states.transition(trade_id, TradeState.REJECTED)
             await self.database.audit("PLACE_ENTRY", trade_id, f"FAILED: {exc}")
             raise
         note = "（公告未指定交易所，已使用本地默认值）" if command.exchange_defaulted else ""
         return f"已提交 {trade_id} 进场挂单至 {command.exchange.value}{note}，订单号 {result.exchange_order_id}"
+
+    async def _place_binance_pending_protection(self, trade_id: str, command: TradeCommand,
+                                                 instrument, adapter) -> None:
+        """Binance 进场受理后立刻预挂全平止盈止损，成交后由监控按实际数量校准。"""
+        assert command.quantity is not None and command.stop_loss is not None
+        close_side = "SELL" if command.side == PositionSide.LONG else "BUY"
+        for order_type, price, place in (
+            ("TAKE_PROFIT", command.take_profits[-1], adapter.place_take_profit),
+            ("STOP_LOSS", command.stop_loss, adapter.place_stop_loss),
+        ):
+            request = OrderRequest(
+                instrument=instrument, position_side=command.side, order_side=close_side,
+                order_type="MARKET", quantity=command.quantity, price=price, reduce_only=True,
+                client_order_id=self._client_order_id(command, f"PENDING_{order_type}"),
+                close_position=True,
+            )
+            result = await place(request)
+            await self.database.execute(
+                "INSERT INTO orders(trade_id,exchange_order_id,client_order_id,order_type,price,quantity,status) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (trade_id, result.exchange_order_id, result.client_order_id, order_type,
+                 str(price), str(command.quantity), result.status.upper()),
+            )
+            await self.database.audit("PLACE_PENDING_PROTECTION", trade_id, "SUCCESS", after=result.raw)
 
     @staticmethod
     def _client_order_id(command: TradeCommand, suffix: str) -> str:

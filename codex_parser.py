@@ -126,6 +126,7 @@ def _extract_json(output: str) -> dict[str, Any]:
 def command_from_json(data: dict[str, Any], command_id: str, settings: Settings) -> TradeCommand:
     try:
         exchange_defaulted = not data.get("exchange")
+        # 未指定交易所时先使用默认列表首项占位，交易服务会在开仓时扩展为全部默认目标。
         exchange = Exchange(str(data.get("exchange") or settings.default_exchange.value).upper())
         entry_data = data.get("entry")
         entry = None if not entry_data else EntrySpec(

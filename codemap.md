@@ -81,7 +81,7 @@ flowchart TD
 | [`exchange_router.py`](file:///f:/projects/CryptoTrade/exchange_router.py) | `ExchangeRouter` | **交易所路由分发**：屏蔽底层交易所差异，根据指令中的交易所枚举将操作分发给对应的 Adapter；支持实盘保护开关（`ALLOW_LIVE_TRADING`）。 |
 | [`exchanges/base.py`](file:///f:/projects/CryptoTrade/exchanges/base.py) | `ExchangeAdapter` (抽象基类), `PaperAdapter` (本地模拟盘) | **统一适配器接口规范**：定义获取权益、获取合约信息、下单（含附带 TP/SL）、撤单、持仓查询等统一抽象异步方法。 |
 | [`exchanges/okx.py`](file:///f:/projects/CryptoTrade/exchanges/okx.py) | `OKXAdapter` | **OKX 官方对接适配器**：支持 OKX 模拟盘（Demo）与实盘（Live），下单前查询具体合约的实际杠杆上限并自动下调，避免 59102 拒单；结合标记价校验可能成交价与附带 TP/SL 的方向，提前拦截币种价格错配及 51051；实现基于 HMAC-SHA256 的请求签名认证与永续合约交互。 |
-| [`exchanges/binance.py`](file:///f:/projects/CryptoTrade/exchanges/binance.py) | `BinanceAdapter` | **Binance 官方对接适配器**：支持 Binance USDⓈ-M Futures 测试网（Testnet）与实盘，处理基于 Timestamp/HMAC 的交易接口。 |
+| [`exchanges/binance.py`](file:///f:/projects/CryptoTrade/exchanges/binance.py) | `BinanceAdapter` | **Binance 官方对接适配器**：支持 Binance USDⓈ-M Futures 测试网（Testnet）与实盘，处理基于 Timestamp/HMAC 的交易接口；进场单受理后使用 `closePosition=true` 立即预挂 TP/SL 条件单。 |
 | [`exchanges/gate.py`](file:///f:/projects/CryptoTrade/exchanges/gate.py) | `GateAdapter` | **Gate.io 官方对接适配器**：支持 Gate Futures 测试网与实盘，实现标准 API 签名与合约下单。 |
 
 ---
@@ -147,7 +147,7 @@ deepseek:
   minimum_confidence: "0.90"
 
 trading:
-  default_exchange: OKX            # 公告未指定交易所时的默认目标
+  default_exchanges: [OKX, BINANCE, GATE] # 公告未指定交易所时分别执行的默认目标
   asset_whitelist: [BTC, ETH, SOL, XAU, PAXG, XAUT] # 交易币种白名单（支持中文别名自动映射）
   position_margin_ratio: "0.02"    # 每笔交易使用账户权益的 2% 作为保证金
   leverage: "100"                  # 杠杆倍数（100倍杠杆对应名义仓位为权益的 2 倍）
@@ -215,7 +215,7 @@ py -m pytest
 `Monitor` 现会从 OKX、Binance、Gate 的订单 WebSocket 事件提取客户订单号和订单状态，并同步本地 `orders` 与交易状态。开仓完整成交后：
 
 - OKX 使用开仓请求中的 `attachAlgoOrds` 原子附带止盈止损；
-- Binance、Gate 按交易所返回的实际持仓数量创建只减仓的止盈、止损单，并写入订单与审计日志；
+- Binance 在进场受理后预挂 `closePosition=true` 的止盈、止损条件单；部分成交时按实际成交量替换为精确只减仓保护单。Gate 按实际持仓数量创建只减仓的止盈、止损单，并写入订单与审计日志；
 - 保护单创建失败时将交易置为 `ERROR_LOCKED`，阻止后续自动操作并输出高优先级日志。
 
 ## 7. 开发者测试模式使用指南

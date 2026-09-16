@@ -25,7 +25,8 @@ deepseek:
 #   minimum_confidence: "0.90"
 
 trading:
-  default_exchange: OKX
+  # 公告未明确交易所时，分别向所有默认目标独立下单。
+  default_exchanges: [OKX, BINANCE, GATE]
   asset_whitelist: [BTC, ETH, SOL, XAU, PAXG, XAUT]
   # 每笔交易使用账户权益的 2% 作为保证金，100 倍杠杆对应 2 倍账户权益的名义仓位。
   position_margin_ratio: "0.02"

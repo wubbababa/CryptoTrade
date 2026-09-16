@@ -105,6 +105,33 @@ def test_okx_bracket_order_payload():
     assert attach["slTriggerPxType"] == "mark"
 
 
+def test_binance_pending_protection_uses_close_position():
+    """未成交进场的 Binance 保护单必须使用全平模式，不能提前传减仓数量。"""
+    from decimal import Decimal
+    from exchanges.binance import BinanceAdapter
+    from models import Instrument, OrderRequest, PositionSide
+
+    adapter = object.__new__(BinanceAdapter)
+    adapter.order_symbols = {}
+    adapter.algo_orders = set()
+    sent_params = None
+
+    async def mock_request(method, path, params=None, private=True, api_key_only=False):
+        nonlocal sent_params
+        assert method == "POST" and path == "/fapi/v1/algoOrder" and private is True
+        sent_params = params
+        return {"algoId": "binance-algo-1", "clientAlgoId": params["clientAlgoId"], "algoStatus": "NEW"}
+
+    adapter._request = mock_request
+    instrument = Instrument("ETH/USDT:PERP", "ETHUSDT", Decimal("0.01"), Decimal("0.001"), Decimal("0.001"), Decimal("0"))
+    request = OrderRequest(instrument, PositionSide.LONG, "SELL", "MARKET", Decimal("1"),
+                           Decimal("2500"), True, "ctpending", close_position=True)
+    asyncio.run(adapter.place_take_profit(request))
+    assert sent_params["closePosition"] == "true"
+    assert "quantity" not in sent_params
+    assert "reduceOnly" not in sent_params
+
+
 def test_okx_leverage_is_capped_by_instrument_limit():
     """配置杠杆超过 OKX 合约上限时，自动采用交易所上限。"""
     from decimal import Decimal

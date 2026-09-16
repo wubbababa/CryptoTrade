@@ -60,6 +60,56 @@ def test_default_exchange_is_marked(settings):
     assert command.exchange == settings.default_exchange
 
 
+def test_legacy_default_exchange_config_is_compatible(settings):
+    """旧版单值配置应继续作为单元素默认目标列表工作。"""
+    source = dict(settings.raw)
+    source["trading"] = dict(source["trading"])
+    source["trading"].pop("default_exchanges", None)
+    source["trading"]["default_exchange"] = "OKX"
+    legacy = Settings(source, settings.root)
+    assert legacy.default_exchanges == (Exchange.OKX,)
+
+
+def test_unspecified_exchange_broadcasts_to_all_available_defaults(settings):
+    """未指定交易所的开仓应为每个默认本地适配器分别创建订单。"""
+    async def scenario():
+        database = Database(settings.database_path)
+        database.initialize()
+        router = ExchangeRouter(settings)
+        service = TradingService(settings, database, router)
+        payload = valid_payload()
+        payload["exchange"] = None
+        report = await service.execute(command_from_json(payload, "tg-broadcast-1", settings))
+        trades = await database.fetch_all("SELECT exchange FROM trade_instances ORDER BY exchange")
+        await router.close()
+        return report, trades
+
+    report, trades = asyncio.run(scenario())
+    assert "公告未指定交易所" in report
+    assert [row["exchange"] for row in trades] == ["BINANCE", "GATE", "OKX"]
+
+
+def test_broadcast_skips_unavailable_exchange_and_continues(settings):
+    """单家适配器不可用时，其余默认交易所仍须完成独立执行。"""
+    async def scenario():
+        database = Database(settings.database_path)
+        database.initialize()
+        router = ExchangeRouter(settings)
+        router.adapters.pop(Exchange.GATE)
+        router.unavailable_reasons[Exchange.GATE] = "测试连接失败"
+        service = TradingService(settings, database, router)
+        payload = valid_payload()
+        payload["exchange"] = None
+        report = await service.execute(command_from_json(payload, "tg-broadcast-2", settings))
+        trades = await database.fetch_all("SELECT exchange FROM trade_instances ORDER BY exchange")
+        await router.close()
+        return report, trades
+
+    report, trades = asyncio.run(scenario())
+    assert "GATE（跳过：测试连接失败）" in report
+    assert [row["exchange"] for row in trades] == ["BINANCE", "OKX"]
+
+
 def test_chinese_asset_alias_gold_normalized_and_validated(settings):
     """测试中文标的名称（如‘黄金’）自动转换为 XAU 并通过白名单校验。"""
     payload = valid_payload()
@@ -133,11 +183,30 @@ def test_paper_order_is_idempotent(settings):
     report, duplicate, orders, open_orders = asyncio.run(scenario())
     assert "已提交" in report
     assert "重复指令" in duplicate
-    assert len(orders) == 1
-    assert len(open_orders) == 1
+    assert [order["order_type"] for order in orders] == ["ENTRY", "TAKE_PROFIT", "STOP_LOSS"]
+    assert len(open_orders) == 3
     # 验证 PaperAdapter 订单中包含了附带的第一止盈目标与止损价格
     assert open_orders[0].raw.get("take_profit_price") == "2519"
     assert open_orders[0].raw.get("stop_loss_price") == "2455"
+
+
+def test_binance_entry_immediately_creates_pending_protection(settings):
+    """Binance 进场单受理后应立刻预挂全平止盈止损，而非等待成交事件。"""
+    async def scenario():
+        database = Database(settings.database_path)
+        database.initialize()
+        router = ExchangeRouter(settings)
+        service = TradingService(settings, database, router)
+        command = command_from_json(valid_payload(), "tg-binance-pending-protection", settings)
+        await service.execute(command)
+        orders = await database.fetch_all("SELECT order_type,status FROM orders ORDER BY id")
+        await router.close()
+        return orders
+
+    orders = asyncio.run(scenario())
+    assert [(row["order_type"], row["status"]) for row in orders] == [
+        ("ENTRY", "NEW"), ("TAKE_PROFIT", "NEW"), ("STOP_LOSS", "NEW"),
+    ]
 
 
 def test_filled_entry_creates_protection_orders_and_opens_trade(settings):
@@ -214,7 +283,9 @@ def test_partial_fill_creates_and_resizes_protection_from_actual_quantity(settin
     entry, entry_row, protections, trade = asyncio.run(scenario())
     assert entry_row["filled_quantity"] == entry["quantity"]
     assert [(row["quantity"], row["status"]) for row in protections] == [
-        ("2", "CANCELED"), (entry["quantity"], "NEW"),
+        (entry["quantity"], "CANCELED"),  # 进场受理后预挂的全平保护单
+        ("2", "CANCELED"),                # 部分成交后按实际数量创建的保护单
+        (entry["quantity"], "NEW"),        # 全部成交后按完整数量校准的保护单
     ]
     assert trade["state"] == "OPEN"
 
