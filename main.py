@@ -16,6 +16,7 @@ from exchange_router import ExchangeRouter
 from monitor import Monitor
 from notifications import EventNotifier
 from settings import Settings
+from startup_reset import StartupResetter
 from telegram_client import TelegramClient
 from telegram_commands import TelegramCommandHandler, UnknownCommand, parse_command
 from trading_service import TradingService
@@ -35,6 +36,8 @@ class Application:
         self.telegram = TelegramClient(settings.raw.get("telegram", {}), self.database)
         self.command_handler = TelegramCommandHandler(self.database, self.router)
         self.notifier = EventNotifier(self.database, self.telegram, settings.raw.get("notifications", {}))
+        # 每次启动都会清空本地业务表并以远端持仓重建快照（见 startup_reset 模块文档）。
+        self.startup_reset = StartupResetter(self.database, self.router, self.notifier)
         self.monitor = Monitor(self.router, self.database, self.notifier)
         self.stop_event = asyncio.Event()
         self.monitor_tasks: list[asyncio.Task] = []
@@ -47,6 +50,10 @@ class Application:
         if telegram_enabled:
             # 先初始化回报通道，使启动对账故障也能及时通知。
             await self.telegram.start()
+        # 清空本地业务表并用远端持仓重建快照；随后启动对账会基于该快照继续核对。
+        reset_report = await self.startup_reset.reset()
+        for warning in reset_report.warnings:
+            logger.critical(warning)
         warnings = await self.monitor.reconcile()
         for warning in warnings:
             logger.critical(warning)

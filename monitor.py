@@ -11,7 +11,7 @@ from decimal import Decimal
 from database import Database
 from breakeven_strategy import calculate_breakeven, should_trigger, stop_only_improves
 from exchange_router import ExchangeRouter
-from models import OrderRequest, PositionSide, TradeState
+from models import OPEN_ORDER_STATES, OrderRequest, PositionSide, TradeState
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +24,18 @@ def _decimal(value) -> Decimal | None:
         return Decimal(str(value))
     except Exception:
         return None
+
+
+def _first_row(payload) -> dict:
+    """取出推送正文的第一行。
+
+    Gate 的订阅回执把 `result` 写成对象（如 `{"status":"success"}`）而不是列表，
+    直接按 `payload[0]` 索引会抛 `KeyError(0)`（日志里表现为「事件流断开…：0」），
+    并让整个事件流任务退出、该交易所的自动保本永久失效。此处统一做形状归一。
+    """
+    if isinstance(payload, list):
+        return payload[0] if payload and isinstance(payload[0], dict) else {}
+    return payload if isinstance(payload, dict) else {}
 
 
 class Monitor:
@@ -58,8 +70,10 @@ class Monitor:
                 # 恢复过程可能刚补建止盈止损，需重新读取远程挂单后再作一致性比较。
                 orders = await adapter.get_open_orders()
                 local = await self.database.fetch_all(
-                    "SELECT client_order_id FROM orders WHERE status IN ('NEW','PARTIALLY_FILLED') AND trade_id IN "
-                    "(SELECT trade_id FROM trade_instances WHERE exchange=?)", (exchange.value,),
+                    "SELECT client_order_id FROM orders WHERE UPPER(status) IN ("
+                    + ",".join("?" for _ in OPEN_ORDER_STATES) + ") AND trade_id IN "
+                    "(SELECT trade_id FROM trade_instances WHERE exchange=?)",
+                    (*OPEN_ORDER_STATES, exchange.value),
                 )
                 local_ids = {row["client_order_id"] for row in local}
                 remote_ids = {order.client_order_id for order in orders}
@@ -152,13 +166,19 @@ class Monitor:
     async def run_adapter(self, exchange, adapter) -> None:
         try:
             async for event in adapter.stream_market_and_account_events():
-                # 高频行情仅用于策略判断，不逐条落库；仅保留账户/订单等可审计事件。
-                if self._extract_order_event(exchange.value, event) is not None:
-                    await self.database.execute(
-                        "INSERT INTO exchange_events(exchange,event_json) VALUES(?,?)",
-                        (exchange.value, json.dumps(event, ensure_ascii=False, default=str)),
-                    )
-                await self.process_event(exchange, adapter, event)
+                # 单条畸形推送不得终止整个事件流：否则该交易所的自动保本会永久失效（见 _first_row）。
+                try:
+                    # 高频行情仅用于策略判断，不逐条落库；仅保留账户/订单等可审计事件。
+                    if self._extract_order_event(exchange.value, event) is not None:
+                        await self.database.execute(
+                            "INSERT INTO exchange_events(exchange,event_json) VALUES(?,?)",
+                            (exchange.value, json.dumps(event, ensure_ascii=False, default=str)),
+                        )
+                    await self.process_event(exchange, adapter, event)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.error("%s 事件处理失败，已跳过该条推送：%s", exchange.value, exc)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -229,7 +249,7 @@ class Monitor:
         if exchange == "OKX":
             if event.get("arg", {}).get("channel") != "orders":
                 return None
-            data = (event.get("data") or [{}])[0]
+            data = _first_row(event.get("data"))
             return data.get("clOrdId", ""), str(data.get("state", "")).upper(), _decimal(data.get("accFillSz")), _decimal(data.get("avgPx"))
         payload = event.get("data", event)
         if exchange == "BINANCE":
@@ -238,7 +258,7 @@ class Monitor:
             order = payload.get("o", {})
             return order.get("c", ""), str(order.get("X", "")).upper(), _decimal(order.get("z")), _decimal(order.get("ap"))
         if exchange == "GATE" and event.get("channel") == "futures.orders":
-            data = (event.get("result") or [{}])[0]
+            data = _first_row(event.get("result"))
             status = data.get("status", "")
             if status == "finished" and data.get("finish_as") == "filled":
                 status = "FILLED"
@@ -252,7 +272,7 @@ class Monitor:
     def _extract_market_event(exchange: str, event: dict) -> tuple[str, Decimal] | None:
         """提取统一合约标识与标记价；只接受交易所推送的实时价格字段。"""
         if exchange == "OKX" and event.get("arg", {}).get("channel") == "tickers":
-            row = (event.get("data") or [{}])[0]
+            row = _first_row(event.get("data"))
             price = row.get("last") or row.get("markPx")
             symbol = row.get("instId", "")
         elif exchange == "BINANCE":
@@ -261,7 +281,7 @@ class Monitor:
                 return None
             price, symbol = row.get("p"), row.get("s", "")
         elif exchange == "GATE" and event.get("channel") == "futures.tickers":
-            row = (event.get("result") or [{}])[0]
+            row = _first_row(event.get("result"))
             price, symbol = row.get("mark_price") or row.get("last"), row.get("contract", "")
         else:
             return None

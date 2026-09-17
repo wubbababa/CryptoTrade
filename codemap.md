@@ -37,6 +37,10 @@ flowchart TD
     L -->|对账/保本/故障| N
     Q[TradeCleaner 僵尸交易清理] -->|仅收敛本地状态| C
     Q -->|只读核对持仓与挂单| J
+    R[OrderSync 远端→本地挂单同步] -->|以交易所为准回填订单/持仓快照| C
+    R -->|只读核对开放订单与单笔状态| J
+    S[StartupResetter 启动清库与远端持仓重建] -->|只读拉取各交易所持仓| J
+    S -->|清空业务表并重建持仓快照| C
     N -->|审计、JSONL、Telegram| O[运行回报]
 ```
 
@@ -48,7 +52,7 @@ flowchart TD
 
 | 文件 | 核心类 / 函数 | 职责与功能说明 |
 | :--- | :--- | :--- |
-| [`main.py`](file:///f:/projects/CryptoTrade/main.py) | `Application`, `async_main`, `main` | **程序主入口**：负责初始化数据库、多交易所路由、监控器、DeepSeek 解析器与 Telegram 客户端；支持 `--dev` 开发测试参数；捕获退出信号并优雅停机。 |
+| [`main.py`](file:///f:/projects/CryptoTrade/main.py) | `Application`, `async_main`, `main` | **程序主入口**：负责初始化数据库、多交易所路由、监控器、DeepSeek 解析器与 Telegram 客户端；在启动对账前先执行 `StartupResetter`（每次启动清空本地业务表并按远端持仓重建快照）；支持 `--dev` 开发测试参数；捕获退出信号并优雅停机。 |
 | [`dev_runner.py`](file:///f:/projects/CryptoTrade/dev_runner.py) | `run_dev_test` | **开发者测试套件**：支持通过 `python main.py --dev` 调试 DeepSeek API 连通性、打印原始返回与结构化实体，并端到端完成开仓。它复用真实的 `ExchangeRouter`：**已配置凭据的交易所会真实下单**（缺凭据的目标仅提示跳过），因此 `--dev` 是当前唯一能暴露真实交易所接口拒单的常规手段（见 §6.1）。 |
 | [`settings.py`](file:///f:/projects/CryptoTrade/settings.py) | `Settings`, `_load_dotenv` | **配置管理与密钥隔离**：轻量读取 `.env` 环境变量与 `config.yaml` 配置文件，提供强类型配置属性访问。 |
 | [`exchanges/credentials.py`](file:///f:/projects/CryptoTrade/exchanges/credentials.py) | `credentials` | **环境凭据隔离**：严格按交易所模式读取 `*_DEMO_*`、`*_TESTNET_*` 或 `*_LIVE_*` 变量，允许同一 `.env` 保存两套凭据而不混用。 |
@@ -77,6 +81,7 @@ flowchart TD
 | [`breakeven_strategy.py`](file:///f:/projects/CryptoTrade/breakeven_strategy.py) | `calculate_breakeven`, `should_trigger`, `stop_only_improves` | **动态保本策略计算**：计算盈利进度达 50%（或自定义比例）时的触发价格，并将止损单动态抬升/下移至进场价上方 1% 处锁定利润。 |
 | [`state_manager.py`](file:///f:/projects/CryptoTrade/state_manager.py) | `StateManager` | **交易状态机管理**：管理单笔交易在生命周期中的状态流转（`RECEIVED` $\to$ `PENDING_ENTRY` $\to$ `OPEN` $\to$ `CLOSED` 等）。 |
 | [`trade_cleanup.py`](file:///f:/projects/CryptoTrade/trade_cleanup.py) | `TradeCleaner`, `CleanupReport`, `run_cleanup`, `main` | **僵尸交易清理**：收敛因失败或中断而卡住的本地交易记录（CLI：`py trade_cleanup.py [--unlock] [--dry-run]`）。**只写本地数据库，绝不下单、撤单或平仓**；默认清理「无活动订单」的未成交交易，`ERROR_LOCKED` 需显式 `--unlock` 且必须在确认远程无持仓、无挂单后才解除，否则跳过并说明原因。 |
+| [`order_sync.py`](file:///f:/projects/CryptoTrade/order_sync.py) | `RemoteOrderSync`, `OrderSyncReport`, `run_order_sync`, `canonical_status`, `main` | **远端→本地挂单状态同步**：启动对账报告「远程数据和本地数据库挂单状态不一致」时，以交易所为最终事实来源把本地 `orders` 收敛到远端（CLI：`py order_sync.py [--dry-run] [--exchange OKX]`）。**只写本地数据库，绝不下单、撤单或平仓**：远端仍开放的挂单保留并刷新累计成交；不在远端开放列表的订单经单笔订单查询（`get_order`）确认最终状态后回填；进场终结且零成交的交易收敛 `CANCELLED`；有成交但远端无持仓只告警不猜归属；远端孤立开放订单只告警（UNTRACKED）；同时对齐 `positions` 快照（补写/清除已平仓位）。 |
 
 ---
 
@@ -85,7 +90,7 @@ flowchart TD
 | 文件 | 核心类 / 函数 | 职责与功能说明 |
 | :--- | :--- | :--- |
 | [`exchange_router.py`](file:///f:/projects/CryptoTrade/exchange_router.py) | `ExchangeRouter` | **交易所路由分发**：屏蔽底层交易所差异，根据指令中的交易所枚举将操作分发给对应的 Adapter；支持实盘保护开关（`ALLOW_LIVE_TRADING`）。 |
-| [`exchanges/base.py`](file:///f:/projects/CryptoTrade/exchanges/base.py) | `ExchangeAdapter` (抽象基类), `PaperAdapter` (本地模拟盘) | **统一适配器接口规范**：定义获取权益、获取合约信息、下单（含附带 TP/SL）、撤单、持仓查询等统一抽象异步方法。 |
+| [`exchanges/base.py`](file:///f:/projects/CryptoTrade/exchanges/base.py) | `ExchangeAdapter` (抽象基类), `PaperAdapter` (本地模拟盘) | **统一适配器接口规范**：定义获取权益、获取合约信息、下单（含附带 TP/SL）、撤单、持仓查询、单笔订单状态查询（`get_order`，供远端→本地挂单同步使用）等统一抽象异步方法。 |
 | [`exchanges/okx.py`](file:///f:/projects/CryptoTrade/exchanges/okx.py) | `OKXAdapter` | **OKX 官方对接适配器**：支持 OKX 模拟盘（Demo）与实盘（Live），下单前查询具体合约的实际杠杆上限并自动下调，避免 59102 拒单；结合标记价校验可能成交价与附带 TP/SL 的方向，提前拦截币种价格错配及 51051；实现基于 HMAC-SHA256 的请求签名认证与永续合约交互。 |
 | [`exchanges/binance.py`](file:///f:/projects/CryptoTrade/exchanges/binance.py) | `BinanceAdapter`, `_conditional`, `_regular` | **Binance 官方对接适配器**：支持 Binance USDⓈ-M Futures 测试网（Testnet）与实盘，处理基于 Timestamp/HMAC 的交易接口；保护单统一以「`quantity` + `reduceOnly=true`」提交（`closePosition` 全平语义因未持仓时会被拒单已移除），由 `Monitor` 在成交后按真实持仓数量补建。 |
 | [`exchanges/gate.py`](file:///f:/projects/CryptoTrade/exchanges/gate.py) | `GateAdapter` | **Gate.io 官方对接适配器**：支持 Gate Futures 测试网与实盘，实现标准 API 签名与合约下单。 |
@@ -96,10 +101,11 @@ flowchart TD
 
 | 文件 | 核心类 / 函数 | 职责与功能说明 |
 | :--- | :--- | :--- |
-| [`monitor.py`](file:///f:/projects/CryptoTrade/monitor.py) | `Monitor` | **后台监控与启动对账引擎**：系统启动时按数量精确关联本地交易与远程仓位并恢复可监控交易；消费订单/行情事件，触发动态保本与保护单故障通知。 |
+| [`monitor.py`](file:///f:/projects/CryptoTrade/monitor.py) | `Monitor`, `_first_row` | **后台监控与启动对账引擎**：系统启动时按数量精确关联本地交易与远程仓位并恢复可监控交易；消费订单/行情事件，触发动态保本与保护单故障通知。`_first_row()` 归一各交易所推送正文形状（Gate 订阅回执的 `result` 是对象而非列表，直接按 `payload[0]` 索引会抛 `KeyError(0)` 并终止整个事件流）；`run_adapter()` 对单条畸形推送只跳过并记录，不再让该交易所的实时策略永久失效。 |
 | [`telegram_client.py`](file:///f:/projects/CryptoTrade/telegram_client.py) | `TelegramClient` | **Telegram 接口交互**：使用 Telegram Bot API 长轮询接收频道/群组新消息，支持发送交易执行结果回报；来源频道与白名单私聊中的 `/` 开头文本会转交命令层，其余文本仍按交易公告解析。 |
 | [`telegram_commands.py`](file:///f:/projects/CryptoTrade/telegram_commands.py) | `TelegramCommandHandler`, `parse_command`, `UnknownCommand` | **Telegram 只读命令层**：实现 `/start`、`/help`、`/status`，汇总本地交易统计、活动交易、本地活动挂单、各交易所权益与最近指令。**不含任何下单/平仓动作**，交易动作仍只能由来源频道公告经解析与校验后触发。 |
 | [`database.py`](file:///f:/projects/CryptoTrade/database.py) | `Database` | **SQLite 数据持久化**：启用 WAL 模式和外键约束，管理消息、交易实例、订单、持仓快照、指令与审计日志表。 |
+| [`startup_reset.py`](file:///f:/projects/CryptoTrade/startup_reset.py) | `StartupResetter`, `StartupResetReport`, `run_startup_reset`, `BUSINESS_TABLES` | **启动清库与远端持仓重建**：按需求在**每次启动**时清空本地业务表（`telegram_messages`、`trade_instances`、`orders`、`positions`、`commands`、`exchange_events`），并以交易所为事实来源重建 `positions` 快照。保留 `runtime_state`（Telegram 轮询断点）与 `audit_logs`（审计追溯）。**只读访问交易所**，绝不下单/撤单/平仓；**先拉取、后清空**——所有交易所都读取失败时放弃清空并告警；**不伪造** `trade_instances`/`orders`（`client_order_id` 为 SHA-256 摘要不可反解，止盈止损参数只存在于本地 `commands`，故清库后自动保本对历史交易不再生效）。由 `Application.run()` 在启动对账前自动调用。 |
 
 ---
 
@@ -219,8 +225,11 @@ py -m pytest
 - [`tests/test_notifications.py`](file:///f:/projects/CryptoTrade/tests/test_notifications.py)：通知审计、级别开关和 Telegram 回报格式测试。
 - [`tests/test_telegram_commands.py`](file:///f:/projects/CryptoTrade/tests/test_telegram_commands.py)：Telegram 只读命令解析与 `/status` 输出内容测试。
 - [`tests/test_cleanup.py`](file:///f:/projects/CryptoTrade/tests/test_cleanup.py)：僵尸交易清理的安全边界测试（有序交易不误清、部分成交不清理、无法核对远程不解锁、dry-run 不写库）。
+- [`tests/test_order_sync.py`](file:///f:/projects/CryptoTrade/tests/test_order_sync.py)：远端→本地挂单同步的安全边界测试（远端仍开放保留挂单、终态回填、零成交收敛、有成交不猜归属、UNTRACKED 只告警、脏状态归一、持仓快照对齐、dry-run 不写库）。
+- [`tests/test_startup_reset.py`](file:///f:/projects/CryptoTrade/tests/test_startup_reset.py)：启动清库的安全边界测试（业务表清空、`runtime_state` 与 `audit_logs` 保留、远端持仓重建、零数量仓位忽略、所有交易所不可读时放弃清空）。
+- [`tests/test_monitor_events.py`](file:///f:/projects/CryptoTrade/tests/test_monitor_events.py)：Monitor 推送解析健壮性测试（Gate 订阅回执为对象形状时不得抛 `KeyError(0)`、形状归一不影响真实推送解析、OKX 无 `data` 回执安全返回 None）。
 
-当前基线：`py -m pytest` 共 **70 项全部通过**（2026-09-16）。注意测试全部基于本地 `PaperAdapter` 或桩替换，**不覆盖真实交易所网络行为**（`credentials.py` 的凭据读取在导入配置阶段即触发，未配置凭据的交易所无法被真实替换），因此真实接口拒单只能靠 `--dev` 实跑或线上对账发现（详见 [`devPLAN.md`](devPLAN.md) §2.1、§3.1）。
+当前基线：`py -m pytest` 共 **91 项全部通过**（2026-09-17）。注意测试全部基于本地 `PaperAdapter` 或桩替换，**不覆盖真实交易所网络行为**（`credentials.py` 的凭据读取在导入配置阶段即触发，未配置凭据的交易所无法被真实替换），因此真实接口拒单只能靠 `--dev` 实跑或线上对账发现（详见 [`devPLAN.md`](devPLAN.md) §2.1、§3.1）。
 
 ---
 
@@ -249,3 +258,23 @@ python trade_cleanup.py --unlock
 # 不连交易所，仅按本地事实清理
 python trade_cleanup.py --no-router
 ```
+
+同步远端挂单状态到本地（**只写数据库，不下单**，用于修复启动对账的「远程数据和本地数据库挂单状态不一致」）：
+
+```bash
+# 先预演，只打印将要发生的变更
+python order_sync.py --dry-run
+
+# 执行同步（以交易所为最终事实来源收敛本地订单/持仓快照）
+python order_sync.py
+
+# 只同步指定交易所
+python order_sync.py --exchange OKX
+```
+
+> **启动即清库**：`python main.py` 每次启动都会先执行 `StartupResetter`（见 §2.5）——
+> 清空全部业务表并以远端持仓重建 `positions` 快照。该行为**无条件生效、不写库前不可预演**，
+> 会永久丢失本地交易历史、指令幂等记录与 `commands.payload_json`（止盈止损参数），
+> 因此清库后的历史交易不再参与自动保本与保护单补建。`runtime_state` 与 `audit_logs` 保留，
+> Telegram 断点不丢。`main.py --dev` 属于一次性开发者测试工具，**不触发**该清库逻辑；
+> 但 `order_sync.py` / `trade_cleanup.py` 等运维工具的 CLI 入口同样不触发。
