@@ -41,6 +41,14 @@ class ExchangeAdapter(ABC):
     @abstractmethod
     async def get_open_orders(self) -> list[OrderResult]: ...
 
+    async def get_order(self, client_order_id: str, exchange_order_id: str | None = None,
+                        instrument_key: str = "") -> OrderResult | None:
+        """按客户订单号/交易所订单号查询单笔订单（含已终结订单），订单不存在时返回 None。
+
+        供「远端→本地挂单状态同步」等只读核对场景使用；默认实现表示不支持。
+        """
+        raise ExchangeError(f"{type(self).__name__} 不支持单笔订单查询")
+
     @abstractmethod
     async def get_positions(self) -> list[PositionSnapshot]: ...
 
@@ -98,6 +106,16 @@ class PaperAdapter(ExchangeAdapter):
 
     async def get_open_orders(self) -> list[OrderResult]:
         return [order for order in self.orders.values() if order.status in {"NEW", "PARTIALLY_FILLED"}]
+
+    async def get_order(self, client_order_id: str, exchange_order_id: str | None = None,
+                        instrument_key: str = "") -> OrderResult | None:
+        """本地模拟盘按客户编号或订单编号查询历史订单。"""
+        for order in self.orders.values():
+            if order.client_order_id == client_order_id or (
+                exchange_order_id is not None and order.exchange_order_id == exchange_order_id
+            ):
+                return order
+        return None
 
     async def get_positions(self) -> list[PositionSnapshot]:
         return list(self.positions)

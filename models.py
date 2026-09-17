@@ -91,6 +91,10 @@ class TradeState(StringEnum):
     ERROR_LOCKED = "ERROR_LOCKED"
 
 
+# 本地订单表中表示「仍在交易所开放/流转」的状态集合（对账与同步共用，避免各处硬编码不一致）。
+OPEN_ORDER_STATES = ("NEW", "OPEN", "PARTIALLY_FILLED", "SUBMITTING")
+
+
 @dataclass(frozen=True, slots=True)
 class EntrySpec:
     type: str

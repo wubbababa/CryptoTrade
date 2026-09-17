@@ -68,12 +68,48 @@ class BinanceAdapter(ExchangeAdapter):
         rows=await self._request("GET","/fapi/v1/openOrders",private=True); results=[]
         for row in rows:
             oid=str(row["orderId"]); self.order_symbols[oid]=row["symbol"]
-            results.append(OrderResult(oid,row.get("clientOrderId",""),row.get("status",""),row))
+            results.append(OrderResult(oid,row.get("clientOrderId",""),self._canonical_status(row.get("status","")),row))
         algos=await self._request("GET","/fapi/v1/openAlgoOrders",private=True)
         for row in algos if isinstance(algos,list) else algos.get("orders",[]):
             oid=str(row["algoId"]); self.order_symbols[oid]=row["symbol"]; self.algo_orders.add(oid)
-            results.append(OrderResult(oid,row.get("clientAlgoId",""),row.get("algoStatus","NEW"),row))
+            results.append(OrderResult(oid,row.get("clientAlgoId",""),self._canonical_status(row.get("algoStatus","NEW")),row))
         return results
+
+    @staticmethod
+    def _canonical_status(status):
+        """统一 Binance 状态：EXPIRED_IN_MATCH 归并到 EXPIRED，其余保持大写标准值。"""
+        value=str(status).upper()
+        return "EXPIRED" if value=="EXPIRED_IN_MATCH" else value
+
+    async def get_order(self,client_order_id,exchange_order_id=None,instrument_key=""):
+        """按订单号或客户订单号查询单笔订单；订单不存在（-2013）时返回 None。"""
+        symbol=""
+        if instrument_key:
+            asset=instrument_key.split("/",1)[0]
+            if not self.instruments:
+                await self.load_instruments()
+            instrument=self.instruments.get(asset)
+            symbol=instrument.exchange_symbol if instrument else f"{asset}USDT"
+        if not symbol:
+            raise ExchangeError("缺少合约标识，无法查询 Binance 订单")
+        params={"symbol":symbol}
+        if exchange_order_id and str(exchange_order_id).isdigit():
+            params["orderId"]=str(exchange_order_id)
+        elif client_order_id:
+            params["origClientOrderId"]=client_order_id
+        else:
+            raise ExchangeError("缺少订单编号，无法查询 Binance 订单")
+        try:
+            row=await self._request("GET","/fapi/v1/order",params,private=True)
+        except ExchangeError as exc:
+            if "-2013" in str(exc):
+                return None
+            raise
+        if not isinstance(row,dict) or not row.get("orderId"):
+            return None
+        oid=str(row["orderId"]); self.order_symbols[oid]=row.get("symbol","")
+        return OrderResult(oid,str(row.get("clientOrderId") or client_order_id),
+                           self._canonical_status(row.get("status","")),row)
 
     async def get_positions(self):
         rows=await self._request("GET","/fapi/v3/positionRisk",private=True); results=[]

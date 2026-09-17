@@ -1,6 +1,6 @@
 """OKX V5 官方 REST 与私有 WebSocket 适配器。"""
 from __future__ import annotations
-import asyncio, base64, hashlib, hmac, json, logging, os, time
+import asyncio, base64, hashlib, hmac, json, logging, os, re, time
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -142,13 +142,63 @@ class OKXAdapter(ExchangeAdapter):
                 f"OKX 持仓模式不匹配：账户 posMode={account.get('posMode')}，配置要求 {expected}"
             )
 
+    # OKX 订单状态到系统标准状态的映射（get_order/get_open_orders 统一输出大写标准状态）。
+    _STATE_MAP = {
+        "live": "NEW",
+        "partially_filled": "PARTIALLY_FILLED",
+        "filled": "FILLED",
+        "canceled": "CANCELED",
+        "mmp_canceled": "CANCELED",
+    }
+
     async def get_open_orders(self) -> list[OrderResult]:
         rows = await self._request("GET", "/api/v5/trade/orders-pending", {"instType":"SWAP"})
         results = []
         for row in rows:
             self.order_symbols[row["ordId"]] = row["instId"]
-            results.append(OrderResult(row["ordId"], row.get("clOrdId", ""), row.get("state", ""), row))
+            results.append(OrderResult(row["ordId"], row.get("clOrdId", ""),
+                                       self._STATE_MAP.get(row.get("state", ""), row.get("state", "")), row))
         return results
+
+    async def get_order(self, client_order_id: str, exchange_order_id: str | None = None,
+                        instrument_key: str = "") -> OrderResult | None:
+        """按客户订单号或交易所订单号查询单笔订单；订单不存在（51110）时返回 None。"""
+        symbol = ""
+        if instrument_key:
+            asset = instrument_key.split("/", 1)[0]
+            if not self.instruments:
+                await self.load_instruments()
+            instrument = self.instruments.get(asset)
+            symbol = instrument.exchange_symbol if instrument else f"{asset}-USDT-SWAP"
+        params: dict = {"instType": "SWAP"}
+        if symbol:
+            params["instId"] = symbol
+        # 优先客户订单号（本地始终记录）；查不到时回退交易所订单号。
+        candidates: list[tuple[str, str]] = []
+        if client_order_id:
+            candidates.append(("clOrdId", str(client_order_id)))
+        if exchange_order_id and str(exchange_order_id).isdigit():
+            candidates.append(("ordId", str(exchange_order_id)))
+        if not candidates:
+            raise ExchangeError("缺少订单编号，无法查询 OKX 订单")
+        for key, value in candidates:
+            query = dict(params, **{key: value})
+            try:
+                rows = await self._request("GET", "/api/v5/trade/order", query)
+            except ExchangeError as exc:
+                # 51110=订单不存在；非法格式客户编号（本地模拟盘历史订单）同样按不存在处理。
+                invalid_client_id = key == "clOrdId" and not re.fullmatch(r"[A-Za-z0-9]{1,32}", value)
+                if "51110" not in str(exc) and not invalid_client_id:
+                    raise
+                continue
+            if rows:
+                row = rows[0]
+                if row.get("ordId"):
+                    self.order_symbols[str(row["ordId"])] = row.get("instId", "")
+                state = str(row.get("state", ""))
+                return OrderResult(str(row.get("ordId", "")), str(row.get("clOrdId") or client_order_id),
+                                   self._STATE_MAP.get(state, state.upper()), row)
+        return None
 
     async def get_positions(self) -> list[PositionSnapshot]:
         if not self.instruments: await self.load_instruments()

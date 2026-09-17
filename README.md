@@ -72,6 +72,7 @@ GATE: {mode: TESTNET}      # 或 LIVE / LOCAL
 python tools/check_exchanges.py
 ```
 
+
 只有相应交易所显示连接成功后，才启动 `main.py`。本地数据库中旧的 `paper-` 模拟订单不会
 出现在官方环境，对账时会产生状态不一致告警；请不要把旧本地模拟数据当成官方订单。
 
@@ -85,6 +86,10 @@ Key，`mode: LIVE` 必须使用实盘 API Key。启动对账或鉴权失败的�
 
 ```powershell
 pytest
+```
+
+```
+py .\main.py --dev --signal "ETH2395-85附近多 目标2405 2409 浮盈一半做保本動作 止损2390"
 ```
 
 ## 安全边界

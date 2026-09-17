@@ -52,13 +52,54 @@ class GateAdapter(ExchangeAdapter):
     async def get_equity(self):
         row=await self._request("GET","/futures/usdt/accounts",private=True)
         self.user_id = str(row.get("user")) if row.get("user") is not None else None
-        return Decimal(row.get("total") or "0")
+        total=Decimal(str(row.get("total", "0")))
+        # Gate 测试网/多币种保证金账户可能返回 total=0，但 available/cross_available 是真实可用权益。
+        # 仅当 total 为 0 时回退；负权益必须原样返回，交由 TradingService 拒绝开仓。
+        if total != 0:
+            return total
+        available=Decimal(str(row.get("available", "0")))
+        cross_available=Decimal(str(row.get("cross_available", "0")))
+        fallback=max(available, cross_available)
+        if fallback > 0:
+            logger.warning("Gate 账户 total=0，回退使用 available=%s/cross_available=%s 作为权益",
+                           available, cross_available)
+        return fallback
     async def get_open_orders(self):
         rows=await self._request("GET","/futures/usdt/orders",{"status":"open"},private=True);result=[]
         for row in rows:
             oid=str(row["id"]);self.order_symbols[oid]=row["contract"]
-            result.append(OrderResult(oid,row.get("text","").removeprefix("t-"),row.get("status",""),row))
+            result.append(OrderResult(oid,row.get("text","").removeprefix("t-"),self._canonical_status(row),row))
         return result
+
+    @staticmethod
+    def _canonical_status(row):
+        """把 Gate 的小写状态统一为系统标准大写状态，避免 'open' 之类的脏状态入库。"""
+        status=str(row.get("status","open")).lower()
+        if status=="open":
+            return "NEW"
+        if status=="finished":
+            return "FILLED" if row.get("finish_as")=="filled" else "CANCELED"
+        return status.upper()
+
+    async def get_order(self,client_order_id,exchange_order_id=None,instrument_key=""):
+        """按订单号或客户订单号（text）查询单笔订单；订单不存在时返回 None。"""
+        order=""
+        if exchange_order_id and str(exchange_order_id).isdigit():
+            order=str(exchange_order_id)
+        elif client_order_id:
+            order=("t-"+client_order_id) if not client_order_id.startswith("t-") else client_order_id
+        if not order:
+            raise ExchangeError("缺少订单编号，无法查询 Gate 订单")
+        try:
+            row=await self._request("GET","/futures/usdt/order",{"order":order},private=True)
+        except ExchangeError as exc:
+            if "ORDER_NOT_FOUND" in str(exc) or "404" in str(exc):
+                return None
+            raise
+        if not isinstance(row,dict) or not row.get("id"):
+            return None
+        oid=str(row["id"]);self.order_symbols[oid]=row.get("contract","")
+        return OrderResult(oid,row.get("text","").removeprefix("t-") or client_order_id,self._canonical_status(row),row)
     async def get_positions(self):
         if not self.instruments:await self.load_instruments()
         by_symbol={v.exchange_symbol:v for v in self.instruments.values()};rows=await self._request("GET","/futures/usdt/positions",private=True);result=[]
@@ -74,7 +115,7 @@ class GateAdapter(ExchangeAdapter):
     def _result(self,row,client=""):
         oid=str(row.get("id") or row.get("order_id", ""));symbol=row.get("contract","")
         if oid:self.order_symbols[oid]=symbol
-        return OrderResult(oid,row.get("text","").removeprefix("t-") or client,row.get("status","open"),row)
+        return OrderResult(oid,row.get("text","").removeprefix("t-") or client,self._canonical_status(row),row)
     async def _regular(self,r):
         r,contracts=self._normalize(r);await self._ensure_leverage(r);size=contracts if r.order_side=="BUY" else -contracts
         payload={"contract":r.instrument.exchange_symbol,"size":_number(size),"price":_number(r.price) if r.price is not None else "0","tif":"gtc" if r.price is not None else "ioc","text":"t-"+r.client_order_id[:28],"reduce_only":r.reduce_only}
