@@ -131,7 +131,7 @@ class Monitor:
             trade_ids = [row["trade_id"] for row in candidates]
             open_client_ids = {order.client_order_id for order in await adapter.get_open_orders()}
             entry_rows = await self.database.fetch_all(
-                "SELECT client_order_id FROM orders WHERE order_type='ENTRY' AND trade_id IN ("
+                "SELECT client_order_id FROM orders WHERE order_type IN ('ENTRY','ADD_ENTRY') AND trade_id IN ("
                 + ",".join("?" for _ in trade_ids) + ")", tuple(trade_ids),
             )
             if {row["client_order_id"] for row in entry_rows} & open_client_ids:
@@ -213,13 +213,14 @@ class Monitor:
         client_order_id, status = order_event.client_order_id, order_event.status
         filled_quantity, average_price = order_event.filled_quantity, order_event.average_price
         rows = await self.database.fetch_all(
-            "SELECT o.trade_id,t.state FROM orders o JOIN trade_instances t ON t.trade_id=o.trade_id "
-            "WHERE o.client_order_id=? AND o.order_type='ENTRY'",
+            "SELECT o.trade_id,o.order_type,t.state FROM orders o JOIN trade_instances t ON t.trade_id=o.trade_id "
+            "WHERE o.client_order_id=? AND o.order_type IN ('ENTRY','ADD_ENTRY')",
             (client_order_id,),
         )
         if not rows:
             return
-        trade_id, current = rows[0]["trade_id"], rows[0]["state"]
+        trade_id, order_type, current = rows[0]["trade_id"], rows[0]["order_type"], rows[0]["state"]
+        is_add_entry = order_type == "ADD_ENTRY"
         if status in {"FILLED", "FINISHED"} and filled_quantity is None:
             # 完全成交时可安全回填已提交数量；部分成交绝不猜测。
             await self.database.execute(
@@ -233,16 +234,17 @@ class Monitor:
         else:
             await self.database.execute("UPDATE orders SET status=? WHERE client_order_id=?", (status, client_order_id))
         if status in {"PARTIALLY_FILLED", "PARTIAL_FILL"}:
-            if current == TradeState.PENDING_ENTRY.value:
+            if current == TradeState.PENDING_ENTRY.value and not is_add_entry:
                 await self._set_state(trade_id, TradeState.PARTIAL_FILL)
-            try:
-                await self._ensure_protection(exchange, adapter, trade_id)
-            except Exception as exc:
-                await self._set_state(trade_id, TradeState.ERROR_LOCKED, force=True)
-                await self._notify("CRITICAL", "PARTIAL_PROTECTION_FAILED", f"部分成交保护单创建失败：{exc}", trade_id)
+            if not is_add_entry:
+                try:
+                    await self._ensure_protection(exchange, adapter, trade_id)
+                except Exception as exc:
+                    await self._set_state(trade_id, TradeState.ERROR_LOCKED, force=True)
+                    await self._notify("CRITICAL", "PARTIAL_PROTECTION_FAILED", f"部分成交保护单创建失败：{exc}", trade_id)
             return
         if status not in {"FILLED", "FINISHED"}:
-            if status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"} and current in {
+            if status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"} and not is_add_entry and current in {
                 TradeState.PENDING_ENTRY.value, TradeState.PARTIAL_FILL.value,
             }:
                 try:
@@ -254,8 +256,13 @@ class Monitor:
                                        f"进场撤销后预挂保护单清理失败：{exc}", trade_id)
             return
         try:
-            await self._ensure_protection(exchange, adapter, trade_id)
-            await self._set_state(trade_id, TradeState.OPEN)
+            if is_add_entry:
+                # 补仓成交后只按当前总数量扩容原止盈；止损由人工「止损/恢复止损」重新设定。
+                await self._resize_take_profit(exchange, adapter, trade_id)
+                await self._set_state(trade_id, TradeState.OPEN)
+            else:
+                await self._ensure_protection(exchange, adapter, trade_id)
+                await self._set_state(trade_id, TradeState.OPEN)
         except Exception as exc:
             await self._set_state(trade_id, TradeState.ERROR_LOCKED, force=True)
             await self.database.audit("PROTECTION_ORDER", trade_id, f"FAILED: {exc}")
@@ -532,6 +539,67 @@ class Monitor:
             )
             await self.database.audit("PLACE_PROTECTION", trade_id, "SUCCESS", after=result.raw)
 
+    async def _resize_take_profit(self, exchange, adapter, trade_id: str) -> None:
+        """补仓成交后按合并仓位数量重建原止盈，止损留给人工重新设定。"""
+        rows = await self.database.fetch_all(
+            "SELECT id,exchange_order_id,client_order_id,price FROM orders "
+            "WHERE trade_id=? AND order_type='TAKE_PROFIT' AND status IN ('NEW','OPEN','PARTIALLY_FILLED') "
+            "ORDER BY id DESC LIMIT 1", (trade_id,),
+        )
+        if not rows:
+            raise ValueError("未找到活动止盈单，拒绝在补仓后猜测保护价格")
+        local = rows[0]
+        remote = next((item for item in await adapter.get_open_orders()
+                       if item.client_order_id == local["client_order_id"]), None)
+        if remote is None:
+            raise ValueError("活动止盈单未在交易所开放订单中，拒绝猜测")
+        trade_rows = await self.database.fetch_all(
+            "SELECT instrument_key,side FROM trade_instances WHERE trade_id=?", (trade_id,)
+        )
+        if not trade_rows:
+            raise ValueError("交易不存在，无法重建补仓后的止盈")
+        instrument_key, side = trade_rows[0]["instrument_key"], PositionSide(trade_rows[0]["side"])
+        quantity = await self._trade_quantity(trade_id)
+        if quantity is None or quantity <= 0:
+            raise ValueError("缺少补仓后的合并成交数量")
+        positions = await adapter.get_positions()
+        position = next((item for item in positions
+                         if item.instrument_key == instrument_key and item.side == side), None)
+        if position is None or position.quantity != quantity:
+            raise ValueError("补仓成交数量与交易所汇总持仓不一致，拒绝重建止盈")
+        instruments = await adapter.load_instruments()
+        asset = instrument_key.split("/", 1)[0]
+        instrument = instruments.get(asset)
+        if instrument is None:
+            raise ValueError(f"交易所未返回合约 {instrument_key}")
+        request = OrderRequest(
+            instrument=instrument, position_side=side,
+            order_side="SELL" if side == PositionSide.LONG else "BUY", order_type="MARKET",
+            quantity=quantity, price=Decimal(str(local["price"])), reduce_only=True,
+            client_order_id=self._protection_client_id(trade_id, f"ADD_TAKE_PROFIT:{quantity}"),
+        )
+        result = await adapter.place_take_profit(request)
+        try:
+            await adapter.cancel_order(remote.exchange_order_id)
+        except Exception:
+            try:
+                await adapter.cancel_order(result.exchange_order_id)
+            except Exception:
+                pass
+            raise
+        await self.database.execute("UPDATE orders SET status='CANCELED' WHERE id=?", (local["id"],))
+        await self.database.execute(
+            "INSERT INTO orders(trade_id,exchange_order_id,client_order_id,order_type,price,quantity,status) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (trade_id, result.exchange_order_id, result.client_order_id, "TAKE_PROFIT",
+             str(local["price"]), str(quantity), result.status.upper()),
+        )
+        await self.database.audit(
+            "RESIZE_TAKE_PROFIT", trade_id, "SUCCESS",
+            before={"quantity": str(local.get("quantity", "")), "price": local["price"]},
+            after={"quantity": str(quantity), "price": local["price"]},
+        )
+
     async def _cancel_pending_protection(self, adapter, trade_id: str) -> None:
         """进场撤销时清理 Binance 等交易所预挂的保护单。"""
         rows = await self.database.fetch_all(
@@ -545,10 +613,10 @@ class Monitor:
     async def _trade_quantity(self, trade_id: str) -> Decimal | None:
         """读取单笔交易的进场数量，作为远程汇总仓位的唯一分配依据。"""
         rows = await self.database.fetch_all(
-            "SELECT filled_quantity FROM orders WHERE trade_id=? AND order_type='ENTRY' "
-            "ORDER BY id DESC LIMIT 1", (trade_id,),
+            "SELECT filled_quantity FROM orders WHERE trade_id=? AND order_type IN ('ENTRY','ADD_ENTRY')",
+            (trade_id,),
         )
-        quantity = Decimal(str(rows[0]["filled_quantity"])) if rows else Decimal("0")
+        quantity = sum((Decimal(str(row["filled_quantity"])) for row in rows), Decimal("0"))
         return quantity if quantity > 0 else None
 
     async def _allocated_quantity(self, trade_ids: list[str]) -> Decimal:
@@ -568,7 +636,7 @@ class Monitor:
             return
         current = rows[0]["state"]
         if not force and target == TradeState.OPEN and current not in {
-            TradeState.PENDING_ENTRY.value, TradeState.PARTIAL_FILL.value,
+            TradeState.PENDING_ENTRY.value, TradeState.PARTIAL_FILL.value, TradeState.WAITING_ADD.value,
         }:
             return
         await self.database.execute(

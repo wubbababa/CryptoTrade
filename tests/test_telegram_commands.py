@@ -18,6 +18,7 @@ from telegram_commands import (
     TelegramCommandHandler,
     UnknownCommand,
     _truncate,
+    parse_manual_keyword,
     parse_command,
     parse_price,
 )
@@ -142,6 +143,17 @@ def test_parse_command_plain_and_with_args():
 
 def test_parse_command_is_case_insensitive():
     assert parse_command("/AMEND_ENTRY x 1") == ("amend_entry", ("x", "1"))
+
+
+def test_parse_manual_keyword_shortcuts():
+    """TG 中文快捷语法只负责识别动作，具体交易仍由命令层唯一匹配。"""
+    assert parse_manual_keyword("BTC 保本离场") == ("breakeven_exit", ("BTC",))
+    assert parse_manual_keyword("BTC 保本") == ("breakeven_stop", ("BTC",))
+    assert parse_manual_keyword("BTC 取消止损") == ("cancel_stop", ("BTC",))
+    assert parse_manual_keyword("BTC 止盈改 62000") == ("amend_take_profit", ("BTC", "62000"))
+    assert parse_manual_keyword("BTC 止损 59000") == ("move_stop", ("BTC", "59000"))
+    assert parse_manual_keyword("BTC 补仓 59000") == ("add_position", ("BTC", "59000"))
+    assert parse_manual_keyword("BTC 保本 62000") is None
 
 
 def test_parse_command_ignores_non_commands_and_other_bots():
@@ -585,6 +597,9 @@ def test_trades_view_shows_per_trade_action_buttons(handler):
     assert any("市价平仓" in label for label in labels)
     assert any("取消止损" in label for label in labels)
     assert any("改止损" in label for label in labels)
+    assert any("盈利保本" in label for label in labels)
+    assert any("保本离场" in label for label in labels)
+    assert any("改止盈" in label for label in labels)
     # 未成交交易不应出现平仓按钮。
     assert not any("市价平仓" in label and "ETH" in label for label in labels)
 
@@ -690,7 +705,10 @@ def test_callback_rejects_malformed_data(handler):
 
 def test_state_actions_cover_known_states():
     """状态→动作映射只包含真实命令名，避免按钮指向不存在的指令。"""
-    valid = {"amend_entry", "cancel_order", "cancel_stop", "move_stop", "close_position"}
+    valid = {
+        "amend_entry", "cancel_order", "cancel_stop", "move_stop", "close_position",
+        "breakeven_stop", "breakeven_exit", "amend_take_profit", "add_position",
+    }
     for state, actions in STATE_ACTIONS.items():
         assert actions, state
         assert set(actions) <= valid, state

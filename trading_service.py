@@ -122,6 +122,10 @@ class TradingService:
             return await self._amend_entry(command, trade, adapter, instrument)
         if command.command_type == CommandType.MOVE_STOP:
             return await self._move_stop(command, trade, adapter, instrument)
+        if command.command_type in {CommandType.AMEND_TAKE_PROFIT, CommandType.BREAKEVEN_EXIT}:
+            return await self._amend_take_profit(command, trade, adapter, instrument)
+        if command.command_type == CommandType.ADD_POSITION:
+            return await self._add_position(command, trade, adapter, instrument)
         if command.command_type == CommandType.CANCEL_ORDER:
             return await self._cancel_by_state(command, trade, adapter)
         if command.command_type == CommandType.CLOSE_POSITION:
@@ -220,6 +224,99 @@ class TradingService:
                                   after={"price": str(new_price)})
         return f"{trade['trade_id']} 止损已更新为 {new_price}"
 
+    async def _amend_take_profit(self, command: TradeCommand, trade: dict,
+                                 adapter, instrument) -> str:
+        """改单止盈；先核对唯一持仓，再先挂新单、后撤旧单，降低裸仓窗口。"""
+        if trade["state"] != TradeState.OPEN.value:
+            raise ValueError("只有已开仓交易可以修改止盈")
+        local, remote = await self._remote_order(adapter, trade["trade_id"], "TAKE_PROFIT")
+        positions = await adapter.get_positions()
+        position = next((item for item in positions
+                         if item.instrument_key == trade["instrument_key"]
+                         and item.side.value == trade["side"]), None)
+        if position is None or position.quantity <= 0:
+            raise ValueError("交易所未找到对应持仓")
+        if command.take_profits:
+            new_price = command.take_profits[0]
+        else:
+            # 保本离场：多单在均价上方 1%，空单在均价下方 1% 退出。
+            new_price = position.average_price * (
+                Decimal("1.01") if command.side == PositionSide.LONG else Decimal("0.99")
+            )
+        if new_price <= 0:
+            raise ValueError("止盈价格必须大于零")
+        request = OrderRequest(
+            instrument, command.side,
+            "SELL" if command.side == PositionSide.LONG else "BUY",
+            "MARKET", Decimal(local["quantity"]), new_price, True,
+            self._client_order_id(command, "MOVE_TP"),
+        )
+        result = await adapter.place_take_profit(request)
+        try:
+            await adapter.cancel_order(remote.exchange_order_id)
+        except Exception:
+            # 旧单撤销失败时撤回新单，避免同一持仓出现两张止盈单。
+            try:
+                await adapter.cancel_order(result.exchange_order_id)
+            except Exception:
+                pass
+            raise
+        await self.database.execute("UPDATE orders SET status='CANCELED' WHERE id=?", (local["id"],))
+        await self.database.execute(
+            "INSERT INTO orders(trade_id,exchange_order_id,client_order_id,order_type,price,quantity,status) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (trade["trade_id"], result.exchange_order_id, result.client_order_id, "TAKE_PROFIT",
+             str(new_price), str(request.quantity), result.status.upper()),
+        )
+        await self.database.audit(
+            "AMEND_TAKE_PROFIT", trade["trade_id"], "SUCCESS",
+            before={"price": local["price"]},
+            after={"price": str(new_price), "order_id": result.exchange_order_id},
+        )
+        return f"{trade['trade_id']} 止盈已更新为 {new_price}"
+
+    async def _add_position(self, command: TradeCommand, trade: dict,
+                            adapter, instrument) -> str:
+        """在取消止损后的等待状态挂补仓单，补仓数量沿用当前已成交数量。"""
+        if trade["state"] != TradeState.WAITING_ADD.value:
+            raise ValueError("只有等待补仓状态可以挂补仓单")
+        assert command.entry is not None
+        active = await self.database.fetch_all(
+            "SELECT exchange_order_id FROM orders WHERE trade_id=? AND order_type='ADD_ENTRY' "
+            "AND status IN ('NEW','OPEN','PARTIALLY_FILLED','SUBMITTING') ORDER BY id DESC LIMIT 1",
+            (trade["trade_id"],),
+        )
+        if active:
+            raise ValueError("该交易已有活动补仓挂单，请勿重复挂单")
+        quantity = await self._filled_quantity(trade["trade_id"])
+        if quantity is None or quantity <= 0:
+            raise ValueError("缺少当前已成交数量，拒绝猜测补仓数量")
+        positions = await adapter.get_positions()
+        position = next((item for item in positions
+                         if item.instrument_key == trade["instrument_key"]
+                         and item.side.value == trade["side"]), None)
+        if position is None or position.quantity <= 0:
+            raise ValueError("交易所未找到对应持仓")
+        price = command.entry.low if command.side == PositionSide.LONG else command.entry.high
+        request = OrderRequest(
+            instrument, command.side,
+            "BUY" if command.side == PositionSide.LONG else "SELL",
+            "LIMIT", quantity, price, False,
+            self._client_order_id(command, "ADD_ENTRY"),
+        )
+        result = await adapter.place_entry_order(request)
+        await self.database.execute(
+            "INSERT INTO orders(trade_id,exchange_order_id,client_order_id,order_type,price,quantity,status) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (trade["trade_id"], result.exchange_order_id, result.client_order_id, "ADD_ENTRY",
+             str(price), str(quantity), result.status.upper()),
+        )
+        await self.database.audit(
+            "ADD_POSITION", trade["trade_id"], "SUCCESS",
+            after={"price": str(price), "quantity": str(quantity), "order_id": result.exchange_order_id},
+        )
+        return f"{trade['trade_id']} 补仓挂单已提交，价格 {price}，数量 {quantity}，订单号 {result.exchange_order_id}"
+
     async def _cancel_by_state(self, command: TradeCommand, trade: dict, adapter) -> str:
         if trade["state"] == TradeState.PARTIAL_FILL.value:
             raise ValueError("进场单已部分成交；请先确认已创建保护单或使用明确平仓指令，拒绝撤余单")
@@ -282,12 +379,12 @@ class TradingService:
         return f"{trade['trade_id']} 已提交市价平仓，订单号 {result.exchange_order_id}"
 
     async def _filled_quantity(self, trade_id: str) -> Decimal | None:
-        """仅使用交易所事件确认的累计成交量，禁止把委托量当作成交量。"""
+        """仅使用成交事件确认的数量，并合并原始进场与补仓成交量。"""
         rows = await self.database.fetch_all(
-            "SELECT filled_quantity FROM orders WHERE trade_id=? AND order_type='ENTRY' ORDER BY id DESC LIMIT 1",
+            "SELECT filled_quantity FROM orders WHERE trade_id=? AND order_type IN ('ENTRY','ADD_ENTRY')",
             (trade_id,),
         )
-        quantity = Decimal(str(rows[0]["filled_quantity"])) if rows else Decimal("0")
+        quantity = sum((Decimal(str(row["filled_quantity"])) for row in rows), Decimal("0"))
         return quantity if quantity > 0 else None
 
     async def _open(self, command: TradeCommand, instrument, leverage: Decimal,

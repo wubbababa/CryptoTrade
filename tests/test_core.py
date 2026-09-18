@@ -512,6 +512,117 @@ def test_amend_entry_requires_exact_remote_order_and_updates_price(settings):
     assert order["price"] == "2470"
 
 
+def test_manual_breakeven_exit_and_take_profit_amendment(settings):
+    """人工保本离场应替换止盈，显式止盈改价也应保留唯一活动订单。"""
+    class DeferredProtectionPaperAdapter(PaperAdapter):
+        @property
+        def entry_protection_attached(self) -> bool:
+            return False
+
+    async def scenario():
+        database = Database(settings.database_path)
+        database.initialize()
+        router = ExchangeRouter(settings)
+        original = router.get(Exchange.BINANCE)
+        adapter = DeferredProtectionPaperAdapter(original.instruments, original.equity)
+        router.adapters[Exchange.BINANCE] = adapter
+        service = TradingService(settings, database, router)
+        opening = command_from_json(valid_payload(), "tg-tp-amend-open", settings)
+        await service.execute(opening)
+        entry = (await database.fetch_all("SELECT * FROM orders WHERE order_type='ENTRY'"))[0]
+        adapter.positions = [PositionSnapshot(
+            Exchange.BINANCE, opening.instrument_key, opening.side,
+            Decimal(entry["quantity"]), Decimal("2480"),
+        )]
+        monitor = Monitor(router, database)
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {"c": entry["client_order_id"], "X": "FILLED"}},
+        })
+        trade_id = (await database.fetch_all("SELECT trade_id FROM trade_instances"))[0]["trade_id"]
+
+        breakeven = valid_payload()
+        breakeven.update({"command_type": "BREAKEVEN_EXIT", "trade_id": trade_id,
+                          "entry": None, "take_profits": [], "stop_loss": None})
+        report = await service.execute(command_from_json(breakeven, "tg-tp-amend-be", settings))
+        explicit = valid_payload()
+        explicit.update({"command_type": "AMEND_TAKE_PROFIT", "trade_id": trade_id,
+                         "entry": None, "take_profits": ["2520"], "stop_loss": None})
+        await service.execute(command_from_json(explicit, "tg-tp-amend-explicit", settings))
+        orders = await database.fetch_all(
+            "SELECT order_type,price,status FROM orders WHERE order_type='TAKE_PROFIT' ORDER BY id"
+        )
+        await router.close()
+        return report, orders
+
+    report, orders = asyncio.run(scenario())
+    assert "止盈已更新为 2504.80" in report
+    assert [(row["price"], row["status"]) for row in orders] == [
+        ("2549", "CANCELED"), ("2504.80", "CANCELED"), ("2520", "NEW")
+    ]
+
+
+def test_waiting_add_places_add_entry_and_resizes_take_profit(settings):
+    """等待补仓状态按原成交量挂单，成交后合并数量并扩容止盈。"""
+    class DeferredProtectionPaperAdapter(PaperAdapter):
+        @property
+        def entry_protection_attached(self) -> bool:
+            return False
+
+    async def scenario():
+        database = Database(settings.database_path)
+        database.initialize()
+        router = ExchangeRouter(settings)
+        original = router.get(Exchange.BINANCE)
+        adapter = DeferredProtectionPaperAdapter(original.instruments, original.equity)
+        router.adapters[Exchange.BINANCE] = adapter
+        service = TradingService(settings, database, router)
+        opening = command_from_json(valid_payload(), "tg-add-open", settings)
+        await service.execute(opening)
+        entry = (await database.fetch_all("SELECT * FROM orders WHERE order_type='ENTRY'"))[0]
+        original_quantity = Decimal(entry["quantity"])
+        adapter.positions = [PositionSnapshot(
+            Exchange.BINANCE, opening.instrument_key, opening.side, original_quantity, Decimal("2480"),
+        )]
+        monitor = Monitor(router, database)
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {"c": entry["client_order_id"], "X": "FILLED"}},
+        })
+        trade_id = (await database.fetch_all("SELECT trade_id FROM trade_instances"))[0]["trade_id"]
+        cancel = valid_payload()
+        cancel.update({"command_type": "CANCEL_ORDER", "trade_id": trade_id,
+                       "entry": None, "take_profits": [], "stop_loss": None})
+        await service.execute(command_from_json(cancel, "tg-add-cancel", settings))
+        add = valid_payload()
+        add.update({"command_type": "ADD_POSITION", "trade_id": trade_id,
+                    "entry": {"type": "LIMIT", "low": "2400", "high": "2400"},
+                    "take_profits": [], "stop_loss": None})
+        await service.execute(command_from_json(add, "tg-add-place", settings))
+        add_order = (await database.fetch_all("SELECT * FROM orders WHERE order_type='ADD_ENTRY'"))[0]
+        adapter.positions = [PositionSnapshot(
+            Exchange.BINANCE, opening.instrument_key, opening.side,
+            original_quantity * 2, Decimal("2440"),
+        )]
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {
+                "c": add_order["client_order_id"], "X": "FILLED", "z": str(original_quantity), "ap": "2400",
+            }},
+        })
+        trade = (await database.fetch_all("SELECT state FROM trade_instances"))[0]
+        orders = await database.fetch_all(
+            "SELECT order_type,quantity,status,price FROM orders ORDER BY id"
+        )
+        await router.close()
+        return trade, orders, original_quantity
+
+    trade, orders, original_quantity = asyncio.run(scenario())
+    assert trade["state"] == "OPEN"
+    assert any(row["order_type"] == "ADD_ENTRY" and row["status"] == "FILLED" for row in orders)
+    take_profits = [row for row in orders if row["order_type"] == "TAKE_PROFIT"]
+    assert [(row["quantity"], row["status"]) for row in take_profits] == [
+        (str(original_quantity), "CANCELED"), (str(original_quantity * 2), "NEW")
+    ]
+
+
 def test_cancel_stop_then_restore_stop_uses_trade_id(settings):
     """已开仓后取消止损会进入 WAITING_ADD，恢复止损必须继续使用同一交易编号。"""
     class DeferredProtectionPaperAdapter(PaperAdapter):

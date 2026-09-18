@@ -67,5 +67,11 @@ class CommandValidator:
             errors.append("修改类指令必须包含唯一交易编号")
         if command.command_type == CommandType.AMEND_ENTRY and command.entry is None:
             errors.append("改进场指令必须包含新的进场价格")
+        if command.command_type == CommandType.ADD_POSITION:
+            if command.entry is None or command.entry.low <= 0 or command.entry.high <= 0:
+                errors.append("补仓指令必须包含有效的补仓价格")
         if command.command_type == CommandType.MOVE_STOP and command.stop_loss is not None and command.stop_loss <= 0:
             errors.append("止损价格必须大于零")
+        if command.command_type == CommandType.AMEND_TAKE_PROFIT:
+            if not command.take_profits or command.take_profits[0] <= 0:
+                errors.append("止盈价格必须大于零")

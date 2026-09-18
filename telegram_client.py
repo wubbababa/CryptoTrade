@@ -91,7 +91,7 @@ class TelegramClient:
         if self.session is None:
             await self.start()
         # 来源频道：所有文本都可能是交易公告。
-        # 命令聊天（如管理员私聊）：只接收 / 开头的文本，不解析为交易公告。
+        # 命令聊天（如管理员私聊）：放行到命令层，由命令层区分斜杠与中文快捷指令。
         allowed = {self.source_chat_id}
         command_allowed = set(self.command_chat_ids)
         while self.running:
@@ -113,8 +113,8 @@ class TelegramClient:
                     chat_id = int(message["chat"]["id"])
                     is_source = bool(allowed) and chat_id in allowed
                     if not is_source:
-                        # 非来源频道仅在显式允许且是命令时才放行。
-                        if chat_id not in command_allowed or not message["text"].strip().startswith("/"):
+                        # 非来源频道只允许白名单聊天；是否为中文快捷指令由命令层判断。
+                        if chat_id not in command_allowed:
                             continue
                     yield TelegramMessage(update["update_id"], chat_id, int(message["message_id"]),
                                           message["text"], str(message.get("date", "")), is_source)

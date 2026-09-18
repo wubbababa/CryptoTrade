@@ -34,10 +34,14 @@ FINGERPRINT_LENGTH = 8
 PRICE_COMMANDS: dict[str, str] = {
     "amend_entry": "<新进场价>",
     "move_stop": "<新止损价|breakeven>",
+    "amend_take_profit": "<新止盈价>",
+    "add_position": "<补仓价>",
 }
 
 # 一键执行（仅需确认）的写指令。
-ONE_CLICK_COMMANDS: tuple[str, ...] = ("cancel_order", "cancel_stop", "close_position")
+ONE_CLICK_COMMANDS: tuple[str, ...] = (
+    "cancel_order", "cancel_stop", "close_position", "breakeven_stop", "breakeven_exit",
+)
 
 # 按钮文案与确认文案。
 COMMAND_LABELS: dict[str, str] = {
@@ -45,6 +49,10 @@ COMMAND_LABELS: dict[str, str] = {
     "cancel_order": "🗑 撤进场挂单",
     "cancel_stop": "🛑 取消止损",
     "move_stop": "🎯 改止损",
+    "amend_take_profit": "🎯 改止盈",
+    "add_position": "➕ 补仓挂价",
+    "breakeven_stop": "🛡 盈利保本",
+    "breakeven_exit": "🚪 保本离场",
     "close_position": "💰 市价平仓",
 }
 
@@ -53,15 +61,26 @@ CONFIRMATION_TEXT: dict[str, str] = {
     "cancel_order": "撤销进场挂单（未成交）或取消止损（已开仓）",
     "cancel_stop": "取消止损，保留持仓与止盈单",
     "move_stop": "修改止损",
+    "amend_take_profit": "修改止盈",
+    "breakeven_stop": "把止损移动到进场价上方 1%（空单为下方 1%）",
+    "breakeven_exit": "把止盈移动到进场价上方 1%（空单为下方 1%）",
     "close_position": "以市价平仓",
 }
 
 # 按交易状态决定可用动作，避免展示必然被拒绝的按钮。
 STATE_ACTIONS: dict[str, tuple[str, ...]] = {
     "PENDING_ENTRY": ("amend_entry", "cancel_order"),
-    "OPEN": ("close_position", "cancel_stop", "move_stop"),
-    "WAITING_ADD": ("move_stop",),
+    "OPEN": (
+        "close_position", "cancel_stop", "move_stop",
+        "breakeven_stop", "breakeven_exit", "amend_take_profit",
+    ),
+    "WAITING_ADD": ("move_stop", "add_position"),
 }
+
+
+def available_actions(state: str) -> tuple[str, ...]:
+    """返回状态对应的完整人工动作集合。"""
+    return STATE_ACTIONS.get(str(state).upper(), ())
 
 # 只读按钮允许触发的命令；按钮不得触达其它入口。
 READONLY_COMMANDS: tuple[str, ...] = ("status", "trades", "help", "start")
@@ -70,7 +89,12 @@ READONLY_COMMANDS: tuple[str, ...] = ("status", "trades", "help", "start")
 TRADES_KEYBOARD_LIMIT = 6
 
 # 全部合法的写指令名，用于校验回调里的命令名（防止伪造回调）。
-WRITE_COMMANDS: tuple[str, ...] = tuple(STATE_ACTIONS["OPEN"]) + ("amend_entry", "cancel_order")
+WRITE_COMMANDS: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        tuple(name for actions in STATE_ACTIONS.values() for name in actions)
+        + ("amend_entry", "cancel_order", "amend_take_profit", "add_position")
+    )
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,7 +223,7 @@ def trades_keyboard(trades: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     rows: list[list[dict[str, Any]]] = []
     for trade in trades[:TRADES_KEYBOARD_LIMIT]:
         trade_id = str(trade["trade_id"])
-        actions = STATE_ACTIONS.get(str(trade.get("state", "")).upper(), ())
+        actions = available_actions(str(trade.get("state", "")))
         if not actions:
             continue
         label = trade_short_label(trade_id)
@@ -208,14 +232,17 @@ def trades_keyboard(trades: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
         one_click = [name for name in actions if name in ONE_CLICK_COMMANDS]
         needs_price = [name for name in actions if name in PRICE_COMMANDS]
         if one_click:
-            rows.append([
-                _button(f"{COMMAND_LABELS[name]} {label}", encode_callback("pick", name, print_fp))
-                for name in one_click
-            ])
+            # 两列一行，避免弹性动作较多时 Telegram 按钮过窄。
+            for start in range(0, len(one_click), 2):
+                rows.append([
+                    _button(f"{COMMAND_LABELS[name]} {label}", encode_callback("pick", name, print_fp))
+                    for name in one_click[start:start + 2]
+                ])
         if needs_price:
-            rows.append([
-                _button(f"{COMMAND_LABELS[name]} {label}", encode_callback("pick", name, print_fp))
-                for name in needs_price
-            ])
+            for start in range(0, len(needs_price), 2):
+                rows.append([
+                    _button(f"{COMMAND_LABELS[name]} {label}", encode_callback("pick", name, print_fp))
+                    for name in needs_price[start:start + 2]
+                ])
     rows.append([_button("⬅️ 返回主菜单", encode_callback("menu"))])
     return rows

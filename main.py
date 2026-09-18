@@ -23,6 +23,7 @@ from telegram_commands import (
     CommandReply,
     TelegramCommandHandler,
     UnknownCommand,
+    parse_manual_keyword,
     parse_command,
 )
 from trading_service import TradingService
@@ -95,6 +96,9 @@ class Application:
         if self._is_command(message):
             await self._handle_command(message)
             return
+        # 白名单命令聊天中的普通文本不是交易公告，避免误交给自然语言开仓解析器。
+        if not message.is_source:
+            return
         command_id = f"tg-{message.chat_id}-{message.message_id}"
         try:
             command = await self.parser.parse(message.text, command_id)
@@ -143,16 +147,26 @@ class Application:
             await self.telegram.reply(callback.chat_id, reply.text, reply.keyboard)
 
     def _is_command(self, message) -> bool:
-        """来源频道的非命令文本按公告处理；命令聊天只接收 / 开头文本。"""
-        return parse_command(message.text, self.telegram.bot_username) is not None
+        """来源频道的非命令文本按公告处理；白名单聊天支持斜杠和中文快捷指令。"""
+        return (
+            parse_command(message.text, self.telegram.bot_username) is not None
+            or parse_manual_keyword(message.text) is not None
+        )
 
     async def _handle_command(self, message) -> None:
         parsed = parse_command(message.text, self.telegram.bot_username)
+        keyword = parse_manual_keyword(message.text) if parsed is None else None
+        if parsed is None:
+            parsed = keyword
         assert parsed is not None
         name, args = parsed
         command_id = f"tg-{message.chat_id}-{message.message_id}"
         try:
-            reply = await self.command_handler.execute_reply(name, args, command_id)
+            if keyword is not None:
+                report = await self.command_handler.execute_keyword(name, args, command_id)
+                reply = CommandReply(report)
+            else:
+                reply = await self.command_handler.execute_reply(name, args, command_id)
             await self.database.audit("TELEGRAM_COMMAND", command_id, f"OK: {name}")
         except UnknownCommand:
             reply = CommandReply(f"未知命令 /{name}。\n\n" + self.command_handler.help_text(),

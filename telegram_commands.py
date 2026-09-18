@@ -20,7 +20,9 @@ from uuid import uuid4
 
 from database import Database
 from exchange_router import ExchangeRouter
-from models import BreakevenSpec, CommandType, EntrySpec, Exchange, PositionSide, TradeCommand
+from models import (
+    BreakevenSpec, CommandType, EntrySpec, Exchange, PositionSide, TradeCommand, normalize_asset,
+)
 from telegram_menu import (
     COMMAND_LABELS,
     CONFIRMATION_TEXT,
@@ -28,6 +30,7 @@ from telegram_menu import (
     READONLY_COMMANDS,
     STATE_ACTIONS,
     WRITE_COMMANDS,
+    available_actions,
     back_keyboard,
     confirm_keyboard,
     decode_callback,
@@ -63,6 +66,13 @@ MANUAL_HELP_LINES = (
     "/cancel_stop <trade_id> - 语义化别名：明确取消止损并保留持仓与止盈",
     "/move_stop <trade_id> <价格> - 修改止损；已达保本条件时会校验只向有利方向移动",
     "/move_stop <trade_id> breakeven - 无参数恢复止损，恢复至进场均价浮盈 1% 处",
+    "/amend_take_profit <trade_id> <价格> - 修改已成交交易的止盈价格",
+    "/add_position <trade_id> <价格> - 在 WAITING_ADD 按当前已成交数量挂补仓单",
+    "BTC 保本离场 - 将止盈移动到进场价浮盈 1% 处",
+    "BTC 保本 - 将止损移动到进场价浮盈 1% 处，原止盈不变",
+    "BTC 取消止损 - 取消止损并保留持仓与止盈",
+    "BTC 挂单改 <价格> / BTC 止盈改 <价格> / BTC 止损改 <价格>",
+    "BTC 恢复止损 - 按进场均价浮盈 1% 恢复止损",
     "/close_position <trade_id> - 明确市价平仓（必须先唯一核对远程持仓）",
 )
 
@@ -73,8 +83,45 @@ MANUAL_COMMAND_TYPES: dict[str, CommandType] = {
     "cancel_order": CommandType.CANCEL_ORDER,
     "cancel_stop": CommandType.CANCEL_ORDER,
     "move_stop": CommandType.MOVE_STOP,
+    "amend_take_profit": CommandType.AMEND_TAKE_PROFIT,
+    "add_position": CommandType.ADD_POSITION,
+    "breakeven_exit": CommandType.BREAKEVEN_EXIT,
+    "breakeven_stop": CommandType.MOVE_STOP,
     "close_position": CommandType.CLOSE_POSITION,
 }
+
+# 中文关键字只作为命令聊天的快捷入口；来源频道的普通文本仍走交易公告解析。
+KEYWORD_ACTIONS: dict[str, str] = {
+    "保本离场": "breakeven_exit",
+    "保本": "breakeven_stop",
+    "取消止损": "cancel_stop",
+    "挂单改": "amend_entry",
+    "止盈改": "amend_take_profit",
+    "止损改": "move_stop",
+    "止损": "move_stop",
+    "恢复止损": "breakeven_stop",
+    "补仓": "add_position",
+}
+
+
+def parse_manual_keyword(text: str) -> tuple[str, tuple[str, ...]] | None:
+    """解析 ``BTC 保本`` 这类人工快捷指令，不负责查找具体交易。"""
+    stripped = text.strip()
+    if not stripped or stripped.startswith("/"):
+        return None
+    pieces = stripped.split()
+    if len(pieces) not in {2, 3}:
+        return None
+    action = KEYWORD_ACTIONS.get(pieces[1])
+    if action is None:
+        return None
+    # 无价格动作禁止偷偷吞掉多余参数，价格动作必须明确给出价格。
+    needs_price = action in {"amend_entry", "amend_take_profit", "move_stop", "add_position"}
+    if needs_price and len(pieces) != 3:
+        return None
+    if not needs_price and len(pieces) != 2:
+        return None
+    return action, tuple(pieces[0:1] + pieces[2:])
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +219,24 @@ class TelegramCommandHandler:
         """兼容入口：只返回回复文本（供测试与纯文本调用方使用）。"""
         return (await self.execute_reply(name, args, command_id)).text
 
+    async def execute_keyword(self, name: str, args: tuple[str, ...] = (),
+                              command_id: str | None = None) -> str:
+        """执行中文快捷指令，并把币种安全解析为唯一活动交易。"""
+        if not args:
+            raise CommandRejected("快捷指令缺少币种，例如：BTC 保本")
+        asset = normalize_asset(args[0])
+        rows = await self._safe_fetch(
+            "SELECT trade_id FROM trade_instances WHERE instrument_key=? "
+            "AND state NOT IN (?,?,?) ORDER BY trade_id DESC LIMIT 20",
+            (f"{asset}/USDT:PERP", *TERMINAL_STATES),
+        )
+        if not rows:
+            raise CommandRejected(f"未找到 {asset} 的活动交易，请先用 /trades 核对交易")
+        if len(rows) > 1:
+            raise CommandRejected(f"{asset} 匹配到多笔活动交易，请改用带 trade_id 的斜杠命令")
+        trade_id = str(rows[0]["trade_id"])
+        return await self._execute_manual(name, (trade_id, *args[1:]), command_id)
+
     async def execute_reply(self, name: str, args: tuple[str, ...] = (),
                             command_id: str | None = None) -> CommandReply:
         """执行一条命令并返回「回复文本 + 可选内联按钮」。
@@ -260,7 +325,10 @@ class TelegramCommandHandler:
         trade = await self._resolve_trade(print_fp)
         trade_id = trade["trade_id"]
         # 复用与手输命令完全相同的人工指令路径，避免两套执行逻辑。
-        report = await self._execute_manual(name, (trade_id,), f"cb-{fingerprint(trade_id)}-{name}")
+        manual_name, manual_args = self._callback_manual_args(name, trade_id)
+        report = await self._execute_manual(
+            manual_name, manual_args, f"cb-{fingerprint(trade_id)}-{name}"
+        )
         text = f"📍 {trade_id}\n{report}"
         return CommandReply(text, back_keyboard(), edit=True)
 
@@ -287,8 +355,10 @@ class TelegramCommandHandler:
             "✏️ 人工指令面板\n"
             "点击「📋 选择交易并操作」会列出每笔活动交易的可用动作按钮。\n\n"
             "说明：\n"
-            "• 撤进场挂单、取消止损、市价平仓属于一键动作，仍需再点一次「确认执行」；\n"
-            "• 改挂单价、改止损价会返回已填好交易编号的命令，只需补一个价格；\n"
+            "• 撤进场挂单、取消止损、盈利保本、保本离场、市价平仓属于一键动作，仍需再点一次「确认执行」；\n"
+            "• 改挂单价、改止盈价、改止损价、补仓会返回已填好交易编号的命令，只需补一个价格；\n"
+            "• 保本离场会把止盈移到进场价浮盈 1%；盈利保本只移动止损，原止盈保持不变；\n"
+            "• 也可在本聊天直接输入：BTC 保本离场、BTC 保本、BTC 取消止损、BTC 止盈改 62000；\n"
             "• 所有动作都会先核对交易所、合约、方向与远程订单/持仓，无法唯一关联即拒绝。"
         )
 
@@ -321,6 +391,7 @@ class TelegramCommandHandler:
         extra = args[1:]
         entry: EntrySpec | None = None
         stop_loss: Decimal | None = None
+        take_profits: tuple[Decimal, ...] = ()
 
         if name == "amend_entry":
             if len(extra) != 1:
@@ -335,6 +406,24 @@ class TelegramCommandHandler:
                 # 「保本」等关键词等价于恢复止损：留空由服务层按进场均价计算。
                 if keyword not in {"breakeven", "be", "保本", "恢复"}:
                     stop_loss = parse_price(extra[0], "止损价格")
+        elif name == "amend_take_profit":
+            if len(extra) != 1:
+                raise CommandRejected("用法：\n" + self._manual_usage(name))
+            take_profits = (parse_price(extra[0], "止盈价格"),)
+        elif name == "add_position":
+            if len(extra) != 1:
+                raise CommandRejected("用法：\n" + self._manual_usage(name))
+            price = parse_price(extra[0], "补仓价格")
+            entry = EntrySpec(type="LIMIT", low=price, high=price)
+        elif name == "breakeven_exit":
+            if extra:
+                raise CommandRejected(f"/{name} 不接受额外参数：{' '.join(extra)}")
+            take_profits = ()
+        elif name == "breakeven_stop":
+            if extra:
+                raise CommandRejected(f"/{name} 不接受额外参数：{' '.join(extra)}")
+            # 服务层根据实时持仓均价计算 1% 保护价。
+            stop_loss = None
         elif extra:
             raise CommandRejected(f"/{name} 不接受额外参数：{' '.join(extra)}")
 
@@ -345,7 +434,7 @@ class TelegramCommandHandler:
             base_asset=_asset_of(trade["instrument_key"]),
             side=PositionSide(trade["side"]),
             entry=entry,
-            take_profits=(),
+            take_profits=take_profits,
             stop_loss=stop_loss,
             quantity=None,
             confidence=MANUAL_CONFIDENCE,
@@ -382,6 +471,13 @@ class TelegramCommandHandler:
         matches = [line for line in MANUAL_HELP_LINES if line.startswith(f"/{name} ")]
         return "\n".join(matches) if matches else f"/{name} <trade_id>"
 
+    @staticmethod
+    def _callback_manual_args(name: str, trade_id: str) -> tuple[str, tuple[str, ...]]:
+        """把 UI 专用的快捷动作映射回稳定的文本命令。"""
+        if name == "breakeven_stop":
+            return "move_stop", (trade_id, "breakeven")
+        return name, (trade_id,)
+
     async def _active_trades(self) -> list[dict[str, Any]]:
         """读取活动交易（按钮与文本视图共用同一份数据）。"""
         return await self._safe_fetch(
@@ -397,7 +493,7 @@ class TelegramCommandHandler:
         if not rows:
             sections.append("  当前没有活动交易")
         for row in rows:
-            actions = STATE_ACTIONS.get(str(row["state"]).upper(), ())
+            actions = available_actions(str(row["state"]))
             labels = "、".join(COMMAND_LABELS[name] for name in actions) or "无可执行动作"
             sections.append(
                 f"  • {row['trade_id']}\n"
