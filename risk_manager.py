@@ -7,6 +7,11 @@ from decimal import Decimal
 from models import TradeCommand
 from settings import Settings
 
+# 名义价值比较的相对容差。仓位数量由「权益 × 保证金比例 × 杠杆 ÷ 价格」得出，Decimal 除法
+# 会留下极小舍入误差（例如上限 3998 被算成 3998.000000000000000000000001）。没有容差时，
+# 恰好用满交易所额度的合规指令会被误判为超限并整笔拒绝（线上表现为「失败：超过该交易所最大持仓名义价值」）。
+_NOTIONAL_TOLERANCE_RATIO = Decimal("1e-9")
+
 
 class RiskError(ValueError):
     pass
@@ -25,5 +30,7 @@ class RiskManager:
         cfg = self.settings.exchange_config(command.exchange)
         notional = command.entry.reference_price * command.quantity
         maximum_notional = equity * Decimal(str(cfg["max_position_notional_ratio"]))
-        if current_notional + notional > maximum_notional:
+        # 仅在舍入噪声范围内视为「正好用满上限」；真正超限仍照旧熔断。
+        tolerance = maximum_notional * _NOTIONAL_TOLERANCE_RATIO
+        if current_notional + notional > maximum_notional + tolerance:
             raise RiskError("超过该交易所最大持仓名义价值")

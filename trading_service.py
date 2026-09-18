@@ -10,6 +10,7 @@ from decimal import Decimal
 
 from database import Database
 from exchange_router import ExchangeRouter
+from exchanges.base import round_step
 from models import CommandType, OrderRequest, PositionSide, TradeCommand, TradeState
 from risk_manager import RiskManager
 from position_sizer import PositionSizer
@@ -100,7 +101,11 @@ class TradingService:
         margin_mode = self.settings.exchange_config(command.exchange).get("margin_mode", "CROSS")
         requested_leverage = Decimal(str(self.settings.raw["trading"]["leverage"]))
         leverage = await adapter.resolve_leverage(instrument, requested_leverage, margin_mode)
-        command = replace(command, quantity=self.position_sizer.calculate(command, equity, leverage))
+        quantity = self.position_sizer.calculate(command, equity, leverage)
+        # 交易所会把委托数量向下取整到合约步进。本地必须记录同一个「实际提交数量」，
+        # 否则重启恢复时拿未取整的委托量对比远程成交持仓必然不一致，自动保本与恢复会被永久拒绝。
+        step = instrument.quantity_step
+        command = replace(command, quantity=round_step(quantity, step) if step > 0 else quantity)
         self.risk.check_open(command, equity)
         return await self._open(command, instrument, leverage, margin_mode)
 

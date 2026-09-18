@@ -28,6 +28,19 @@ class ExchangeAdapter(ABC):
         """返回交易所允许的实际杠杆；默认适配器直接采用配置值。"""
         return requested
 
+    async def to_base_quantity(self, exchange_symbol: str, quantity: Decimal) -> Decimal:
+        """把交易所回报的成交量换算为标的（基础币）数量。
+
+        OKX、Gate 等市场以「合约张数」回报成交量，必须先乘以合约面值倍率，才能与本地按
+        标的数量记录的委托量、远程仓位直接比较（否则本地数量会比远程仓位多若干倍，
+        自动保本与持仓恢复会被永久拒绝）；Binance 等本身即为基础币数量，原样返回。
+        """
+        instruments = getattr(self, "instruments", None) or await self.load_instruments()
+        for instrument in instruments.values():
+            if instrument.exchange_symbol == exchange_symbol:
+                return quantity * instrument.contract_multiplier
+        return quantity
+
     async def validate_account(self) -> None:
         """启动时检查账户配置；本地模拟无需远端检查。"""
         return None

@@ -12,7 +12,7 @@ from exchanges.base import PaperAdapter
 from models import Exchange, PositionSide, PositionSnapshot
 from monitor import Monitor
 from position_sizer import PositionSizer
-from risk_manager import RiskManager
+from risk_manager import RiskError, RiskManager
 from settings import Settings
 from trading_service import TradingService
 from validator import CommandValidator, ValidationError
@@ -554,3 +554,104 @@ def test_cancel_stop_then_restore_stop_uses_trade_id(settings):
     assert "2470" in report
     assert trade["state"] == "OPEN"
     assert [(row["price"], row["status"]) for row in stops] == [("2455", "CANCELED"), ("2470", "NEW")]
+
+
+def test_notional_exactly_at_exchange_limit_is_not_rejected(settings):
+    """仓位数量带除法舍入误差时，恰好用满交易所额度的指令不得被误拒。
+
+    线上表现：Gate 权益 1999、进场价 2477 时名义价值算成 3998.000000000000000000000001，
+    超过上限 3998 而被拒绝，日志为「失败：超过该交易所最大持仓名义价值」。
+    """
+    payload = valid_payload()
+    payload.update({"exchange": "GATE", "entry": {"type": "RANGE", "low": "2475", "high": "2479"}})
+    command = command_from_json(payload, "tg-limit-1", settings)
+    equity = Decimal("1999")
+    assert command.entry is not None
+    # 仓位数量 = 权益 × 保证金比例 × 杠杆 ÷ 价格，对应名义价值恰好等于「2 倍权益」的上限。
+    quantity = equity * Decimal("0.02") * Decimal("100") / command.entry.reference_price
+    RiskManager(settings).check_open(replace(command, quantity=quantity), equity)
+    with pytest.raises(RiskError, match="最大持仓名义价值"):
+        RiskManager(settings).check_open(replace(command, quantity=Decimal("1.62")), equity)
+
+
+def test_entry_quantity_is_recorded_as_step_rounded_submitted_quantity(settings):
+    """本地必须记录交易所实际收到的取整数量，否则重启恢复时无法与远程持仓对齐。"""
+    async def scenario():
+        database = Database(settings.database_path)
+        database.initialize()
+        router = ExchangeRouter(settings)
+        adapter = router.get(Exchange.BINANCE)
+        adapter.equity = Decimal("1999")
+        payload = valid_payload()
+        payload["entry"] = {"type": "RANGE", "low": "2475", "high": "2479"}
+        await TradingService(settings, database, router).execute(
+            command_from_json(payload, "tg-step-1", settings),
+        )
+        row = (await database.fetch_all(
+            "SELECT quantity,exchange_order_id FROM orders WHERE order_type='ENTRY'"))[0]
+        submitted = adapter.orders[row["exchange_order_id"]].raw["quantity"]
+        await router.close()
+        return row["quantity"], submitted
+
+    stored, submitted = asyncio.run(scenario())
+    # 1999 × 2 ÷ 2477 = 1.6140492…，按 0.001 步进向下取整后才是提交给交易所的数量。
+    assert stored == submitted == "1.614"
+
+
+def test_okx_contract_fills_use_base_quantity_for_breakeven(settings):
+    """OKX 以合约张数回报成交：换算后本地数量与远程仓位一致，汇总仓位才允许自动保本。"""
+    class ContractSizePaperAdapter(PaperAdapter):
+        """模拟 OKX ETH-USDT-SWAP：1 张合约 = 0.1 ETH，且保护单需成交后补建。"""
+
+        @property
+        def entry_protection_attached(self) -> bool:
+            return False
+
+    async def scenario():
+        database = Database(settings.database_path)
+        database.initialize()
+        router = ExchangeRouter(settings)
+        original = router.get(Exchange.OKX)
+        instruments = {
+            asset: replace(instrument, quantity_step=Decimal("0.1"), minimum_quantity=Decimal("0.1"),
+                           contract_multiplier=Decimal("0.1"))
+            for asset, instrument in original.instruments.items()
+        }
+        adapter = ContractSizePaperAdapter(instruments, Decimal("1999"))
+        router.adapters[Exchange.OKX] = adapter
+        payload = valid_payload()
+        payload.update({"exchange": "OKX", "entry": {"type": "RANGE", "low": "2475", "high": "2479"}})
+        command = command_from_json(payload, "tg-okx-units-1", settings)
+        await TradingService(settings, database, router).execute(command)
+        entry = (await database.fetch_all(
+            "SELECT client_order_id,quantity FROM orders WHERE order_type='ENTRY'"))[0]
+        quantity = Decimal(entry["quantity"])
+        adapter.positions = [PositionSnapshot(
+            Exchange.OKX, command.instrument_key, command.side, quantity, Decimal("2477"),
+        )]
+        monitor = Monitor(router, database)
+        await monitor.process_event(Exchange.OKX, adapter, {
+            "arg": {"channel": "orders"}, "data": [{
+                "clOrdId": entry["client_order_id"], "state": "filled",
+                "accFillSz": str(quantity / Decimal("0.1")), "avgPx": "2477",
+                "instId": "ETH-USDT-SWAP",
+            }],
+        })
+        filled = (await database.fetch_all(
+            "SELECT filled_quantity FROM orders WHERE order_type='ENTRY'"))[0]["filled_quantity"]
+        # 最终止盈 2549、均价 2477：50% 触发价 2513，标记价 2520 已满足保本条件。
+        await monitor.process_event(Exchange.OKX, adapter, {
+            "arg": {"channel": "tickers"}, "data": [{"instId": "ETH-USDT-SWAP", "last": "2520"}],
+        })
+        stops = await database.fetch_all(
+            "SELECT price,status FROM orders WHERE order_type='STOP_LOSS' ORDER BY id")
+        trade = (await database.fetch_all("SELECT state,breakeven_triggered FROM trade_instances"))[0]
+        await router.close()
+        return quantity, filled, stops, trade
+
+    quantity, filled, stops, trade = asyncio.run(scenario())
+    assert quantity == Decimal("1.6")
+    assert Decimal(filled) == quantity
+    assert trade["state"] == "OPEN"
+    assert trade["breakeven_triggered"] == 1
+    assert [(row["price"], row["status"]) for row in stops] == [("2455", "CANCELED"), ("2501.77", "NEW")]

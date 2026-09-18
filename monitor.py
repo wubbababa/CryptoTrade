@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+from dataclasses import dataclass, replace
 from decimal import Decimal
 
 from database import Database
@@ -38,11 +39,28 @@ def _first_row(payload) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+@dataclass(frozen=True, slots=True)
+class OrderEvent:
+    """归一后的订单推送。
+
+    `filled_quantity` 一律为标的（基础币）数量：OKX、Gate 以合约张数回报成交量，必须按
+    合约面值倍率换算后再落库，否则本地数量会比远程仓位多若干倍，自动保本会被永久拒绝。
+    """
+
+    client_order_id: str
+    status: str
+    filled_quantity: Decimal | None
+    average_price: Decimal | None
+    symbol: str = ""
+
+
 class Monitor:
     def __init__(self, router: ExchangeRouter, database: Database, notifier=None) -> None:
         self.router = router
         self.database = database
         self.notifier = notifier
+        # 记录最近一次「仓位归属不一致」的签名，避免每个行情推送都重复写审计与告警。
+        self._association_reported: dict[tuple[str, str, str], str] = {}
 
     async def _notify(self, level: str, event: str, message: str, subject_id: str | None = None,
                       details: dict | None = None) -> None:
@@ -186,13 +204,14 @@ class Monitor:
 
     async def process_event(self, exchange, adapter, event: dict) -> None:
         """处理订单与行情事件。"""
-        order_event = self._extract_order_event(exchange.value, event)
+        order_event = await self._parse_order_event(exchange, adapter, event)
         if order_event is None:
             market_event = self._extract_market_event(exchange.value, event)
             if market_event is not None:
                 await self._process_breakeven(exchange, adapter, *market_event)
             return
-        client_order_id, status, filled_quantity, average_price = order_event
+        client_order_id, status = order_event.client_order_id, order_event.status
+        filled_quantity, average_price = order_event.filled_quantity, order_event.average_price
         rows = await self.database.fetch_all(
             "SELECT o.trade_id,t.state FROM orders o JOIN trade_instances t ON t.trade_id=o.trade_id "
             "WHERE o.client_order_id=? AND o.order_type='ENTRY'",
@@ -243,20 +262,37 @@ class Monitor:
             logger.critical("%s 开仓已成交但保护单创建失败，交易已锁定：%s", trade_id, exc)
             await self._notify("CRITICAL", "PROTECTION_FAILED", f"开仓已成交但保护单创建失败：{exc}", trade_id)
 
+    async def _parse_order_event(self, exchange, adapter, event: dict) -> OrderEvent | None:
+        """解析订单推送，并把交易所回报的成交量统一换算为标的（基础币）数量。"""
+        parsed = self._extract_order_event(exchange.value, event)
+        # 订阅回执等推送没有合约字段，也就没有可换算的成交量，交给后续查库自然忽略。
+        if parsed is None or parsed.filled_quantity is None or not parsed.symbol:
+            return parsed
+        base_quantity = await adapter.to_base_quantity(parsed.symbol, parsed.filled_quantity)
+        return replace(parsed, filled_quantity=base_quantity)
+
     @staticmethod
-    def _extract_order_event(exchange: str, event: dict) -> tuple[str, str, Decimal | None, Decimal | None] | None:
-        """把三家交易所的订单推送压缩成客户订单号和状态。"""
+    def _extract_order_event(exchange: str, event: dict) -> OrderEvent | None:
+        """把三家交易所的订单推送压缩成客户订单号、状态、成交量与合约代码。
+
+        此处保留交易所原始计量单位（OKX/Gate 为合约张数），由 `_parse_order_event` 结合
+        适配器的合约面值倍率换算成标的数量，避免换算规则在多处重复维护。
+        """
         if exchange == "OKX":
             if event.get("arg", {}).get("channel") != "orders":
                 return None
             data = _first_row(event.get("data"))
-            return data.get("clOrdId", ""), str(data.get("state", "")).upper(), _decimal(data.get("accFillSz")), _decimal(data.get("avgPx"))
+            return OrderEvent(str(data.get("clOrdId", "")), str(data.get("state", "")).upper(),
+                              _decimal(data.get("accFillSz")), _decimal(data.get("avgPx")),
+                              str(data.get("instId", "")))
         payload = event.get("data", event)
         if exchange == "BINANCE":
             if payload.get("e") != "ORDER_TRADE_UPDATE":
                 return None
             order = payload.get("o", {})
-            return order.get("c", ""), str(order.get("X", "")).upper(), _decimal(order.get("z")), _decimal(order.get("ap"))
+            return OrderEvent(str(order.get("c", "")), str(order.get("X", "")).upper(),
+                              _decimal(order.get("z")), _decimal(order.get("ap")),
+                              str(order.get("s", "")))
         if exchange == "GATE" and event.get("channel") == "futures.orders":
             data = _first_row(event.get("result"))
             status = data.get("status", "")
@@ -265,7 +301,8 @@ class Monitor:
             size = _decimal(data.get("size"))
             left = _decimal(data.get("left"))
             filled = abs(size - left) if size is not None and left is not None else None
-            return str(data.get("text", "")).removeprefix("t-"), str(status).upper(), filled, _decimal(data.get("fill_price"))
+            return OrderEvent(str(data.get("text", "")).removeprefix("t-"), str(status).upper(),
+                              filled, _decimal(data.get("fill_price")), str(data.get("contract", "")))
         return None
 
     @staticmethod
@@ -313,15 +350,22 @@ class Monitor:
         if position is None or position.quantity <= 0:
             return
         expected_quantity = await self._allocated_quantity([trade["trade_id"] for trade in trades])
+        association_key = (exchange.value, instrument_key, side.value)
         if expected_quantity != position.quantity:
             reason = (f"远程仓位={position.quantity}，本地已关联交易数量={expected_quantity}；"
                       "拒绝对汇总仓位执行自动保本")
-            for trade in trades:
-                await self.database.audit("POSITION_ASSOCIATION", trade["trade_id"], "MISMATCH", after={
-                    "instrument_key": instrument_key, "side": side.value, "reason": reason,
-                })
-            logger.warning("%s %s", instrument_key, reason)
+            # 行情推送每秒可达十余条，同一处不一致只记录一次，避免审计表被同一原因刷爆。
+            signature = f"{position.quantity}/{expected_quantity}"
+            if self._association_reported.get(association_key) != signature:
+                self._association_reported[association_key] = signature
+                for trade in trades:
+                    await self.database.audit("POSITION_ASSOCIATION", trade["trade_id"], "MISMATCH", after={
+                        "instrument_key": instrument_key, "side": side.value, "reason": reason,
+                    })
+                logger.warning("%s %s", instrument_key, reason)
             return
+        # 数量重新对齐后清除记录，便于后续再次出现不一致时重新告警。
+        self._association_reported.pop(association_key, None)
         for trade in trades:
             try:
                 await self._trigger_breakeven(

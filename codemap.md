@@ -75,9 +75,9 @@ flowchart TD
 
 | 文件 | 核心类 / 函数 | 职责与功能说明 |
 | :--- | :--- | :--- |
-| [`trading_service.py`](file:///f:/projects/CryptoTrade/trading_service.py) | `TradingService`, `_execute_default_exchanges`, `_place_binance_pending_protection` | **交易用例编排层**：负责指令幂等落库、账户权益获取、动态名义仓位计算、风险检查、进场限价挂单，以及基于 `trade_id` 远端核对的改挂单、撤单、止损恢复和市价平仓。公告未指定交易所的开仓指令会按 `trading.default_exchanges` **逐交易所独立广播**（子指令编号形如 `<command_id>-OKX`，各自幂等与审计），单家失败不阻断其余交易所，并在回报中标注跳过原因。 |
+| [`trading_service.py`](file:///f:/projects/CryptoTrade/trading_service.py) | `TradingService`, `_execute_default_exchanges`, `_place_binance_pending_protection` | **交易用例编排层**：负责指令幂等落库、账户权益获取、动态名义仓位计算、风险检查、进场限价挂单，以及基于 `trade_id` 远端核对的改挂单、撤单、止损恢复和市价平仓。公告未指定交易所的开仓指令会按 `trading.default_exchanges` **逐交易所独立广播**（子指令编号形如 `<command_id>-OKX`，各自幂等与审计），单家失败不阻断其余交易所，并在回报中标注跳过原因。仓位数量统一按合约步进 `round_step` 向下取整后再落库与下单，保证本地记录的就是交易所实际收到的数量（否则重启恢复时用未取整的委托量比对远程持仓必然不一致，自动策略无法恢复）。 |
 | [`position_sizer.py`](file:///f:/projects/CryptoTrade/position_sizer.py) | `PositionSizer` | **资金管理与仓位计算**：根据配置的保证金比例（默认账户权益 2%）与杠杆倍数（默认 100x）计算实际开仓标的数量。 |
-| [`risk_manager.py`](file:///f:/projects/CryptoTrade/risk_manager.py) | `RiskManager`, `RiskExceededError` | **风控检查**：对指令名义价值进行上限校验（如不得超过账户权益的 2 倍），超出即熔断拒绝。 |
+| [`risk_manager.py`](file:///f:/projects/CryptoTrade/risk_manager.py) | `RiskManager`, `RiskError` | **风控检查**：对指令名义价值进行上限校验（如不得超过账户权益的 2 倍），超出即熔断拒绝。比较带 `1e-9` 相对容差：仓位数量来自除法，Decimal 会留下极小舍入误差（如上限 3998 被算成 3998.000000000000000000000001），无容差时恰好用满交易所额度的合规指令会被误拒（线上表现为「失败：超过该交易所最大持仓名义价值」）。 |
 | [`breakeven_strategy.py`](file:///f:/projects/CryptoTrade/breakeven_strategy.py) | `calculate_breakeven`, `should_trigger`, `stop_only_improves` | **动态保本策略计算**：计算盈利进度达 50%（或自定义比例）时的触发价格，并将止损单动态抬升/下移至进场价上方 1% 处锁定利润。 |
 | [`state_manager.py`](file:///f:/projects/CryptoTrade/state_manager.py) | `StateManager` | **交易状态机管理**：管理单笔交易在生命周期中的状态流转（`RECEIVED` $\to$ `PENDING_ENTRY` $\to$ `OPEN` $\to$ `CLOSED` 等）。 |
 | [`trade_cleanup.py`](file:///f:/projects/CryptoTrade/trade_cleanup.py) | `TradeCleaner`, `CleanupReport`, `run_cleanup`, `main` | **僵尸交易清理**：收敛因失败或中断而卡住的本地交易记录（CLI：`py trade_cleanup.py [--unlock] [--dry-run]`）。**只写本地数据库，绝不下单、撤单或平仓**；默认清理「无活动订单」的未成交交易，`ERROR_LOCKED` 需显式 `--unlock` 且必须在确认远程无持仓、无挂单后才解除，否则跳过并说明原因。 |
@@ -90,10 +90,10 @@ flowchart TD
 | 文件 | 核心类 / 函数 | 职责与功能说明 |
 | :--- | :--- | :--- |
 | [`exchange_router.py`](file:///f:/projects/CryptoTrade/exchange_router.py) | `ExchangeRouter` | **交易所路由分发**：屏蔽底层交易所差异，根据指令中的交易所枚举将操作分发给对应的 Adapter；支持实盘保护开关（`ALLOW_LIVE_TRADING`）。 |
-| [`exchanges/base.py`](file:///f:/projects/CryptoTrade/exchanges/base.py) | `ExchangeAdapter` (抽象基类), `PaperAdapter` (本地模拟盘) | **统一适配器接口规范**：定义获取权益、获取合约信息、下单（含附带 TP/SL）、撤单、持仓查询、单笔订单状态查询（`get_order`，供远端→本地挂单同步使用）等统一抽象异步方法。 |
+| [`exchanges/base.py`](file:///f:/projects/CryptoTrade/exchanges/base.py) | `ExchangeAdapter` (抽象基类), `PaperAdapter` (本地模拟盘) | **统一适配器接口规范**：定义获取权益、获取合约信息、下单（含附带 TP/SL）、撤单、持仓查询、单笔订单状态查询（`get_order`，供远端→本地挂单同步使用）、把交易所回报的合约张数换算为标的数量的 `to_base_quantity`（按合约面值倍率，OKX/Gate 面值不为 1）等统一抽象异步方法。 |
 | [`exchanges/okx.py`](file:///f:/projects/CryptoTrade/exchanges/okx.py) | `OKXAdapter` | **OKX 官方对接适配器**：支持 OKX 模拟盘（Demo）与实盘（Live），下单前查询具体合约的实际杠杆上限并自动下调，避免 59102 拒单；结合标记价校验可能成交价与附带 TP/SL 的方向，提前拦截币种价格错配及 51051；实现基于 HMAC-SHA256 的请求签名认证与永续合约交互。 |
 | [`exchanges/binance.py`](file:///f:/projects/CryptoTrade/exchanges/binance.py) | `BinanceAdapter`, `_conditional`, `_regular` | **Binance 官方对接适配器**：支持 Binance USDⓈ-M Futures 测试网（Testnet）与实盘，处理基于 Timestamp/HMAC 的交易接口；保护单统一以「`quantity` + `reduceOnly=true`」提交（`closePosition` 全平语义因未持仓时会被拒单已移除），由 `Monitor` 在成交后按真实持仓数量补建。 |
-| [`exchanges/gate.py`](file:///f:/projects/CryptoTrade/exchanges/gate.py) | `GateAdapter` | **Gate.io 官方对接适配器**：支持 Gate Futures 测试网与实盘，实现标准 API 签名与合约下单。 |
+| [`exchanges/gate.py`](file:///f:/projects/CryptoTrade/exchanges/gate.py) | `GateAdapter`, `_contract_count` | **Gate.io 官方对接适配器**：支持 Gate Futures 测试网与实盘，实现标准 API 签名与合约下单；权益 `total=0` 时回退 `available/cross_available`（测试网常见形态）。条件单 `/futures/usdt/price_orders` 的 `initial.size` 为 Go `int64`，必须提交 JSON 整数（`_contract_count`），传字符串会被 400 `AUTO_INVALID_REQUEST_BODY` 拒绝（线上表现：开仓已成交但保护单创建失败）；普通下单接口沿用字符串数量。 |
 
 ---
 
@@ -101,7 +101,7 @@ flowchart TD
 
 | 文件 | 核心类 / 函数 | 职责与功能说明 |
 | :--- | :--- | :--- |
-| [`monitor.py`](file:///f:/projects/CryptoTrade/monitor.py) | `Monitor`, `_first_row` | **后台监控与启动对账引擎**：系统启动时按数量精确关联本地交易与远程仓位并恢复可监控交易；消费订单/行情事件，触发动态保本与保护单故障通知。`_first_row()` 归一各交易所推送正文形状（Gate 订阅回执的 `result` 是对象而非列表，直接按 `payload[0]` 索引会抛 `KeyError(0)` 并终止整个事件流）；`run_adapter()` 对单条畸形推送只跳过并记录，不再让该交易所的实时策略永久失效。 |
+| [`monitor.py`](file:///f:/projects/CryptoTrade/monitor.py) | `Monitor`, `OrderEvent`, `_first_row`, `_parse_order_event` | **后台监控与启动对账引擎**：系统启动时按数量精确关联本地交易与远程仓位并恢复可监控交易；消费订单/行情事件，触发动态保本与保护单故障通知。`_first_row()` 归一各交易所推送正文形状（Gate 订阅回执的 `result` 是对象而非列表，直接按 `payload[0]` 索引会抛 `KeyError(0)` 并终止整个事件流）；`run_adapter()` 对单条畸形推送只跳过并记录，不再让该交易所的实时策略永久失效。订单推送经 `_parse_order_event()` 统一把成交量换算为标的数量（OKX/Gate 以合约张数成交，直接入库会让本地数量比远程仓位大若干倍，线上表现为「远程仓位=77.54，本地已关联交易数量=775.4；拒绝对汇总仓位执行自动保本」）；同一处仓位归属不一致只写一条审计与一条告警，不再随行情推送逐条刷屏（行情每秒可达十余条）。 |
 | [`telegram_client.py`](file:///f:/projects/CryptoTrade/telegram_client.py) | `TelegramClient` | **Telegram 接口交互**：使用 Telegram Bot API 长轮询接收频道/群组新消息，支持发送交易执行结果回报；来源频道与白名单私聊中的 `/` 开头文本会转交命令层，其余文本仍按交易公告解析。 |
 | [`telegram_commands.py`](file:///f:/projects/CryptoTrade/telegram_commands.py) | `TelegramCommandHandler`, `parse_command`, `UnknownCommand` | **Telegram 只读命令层**：实现 `/start`、`/help`、`/status`，汇总本地交易统计、活动交易、本地活动挂单、各交易所权益与最近指令。**不含任何下单/平仓动作**，交易动作仍只能由来源频道公告经解析与校验后触发。 |
 | [`database.py`](file:///f:/projects/CryptoTrade/database.py) | `Database` | **SQLite 数据持久化**：启用 WAL 模式和外键约束，管理消息、交易实例、订单、持仓快照、指令与审计日志表。 |

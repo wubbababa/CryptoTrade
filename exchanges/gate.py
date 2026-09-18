@@ -12,6 +12,17 @@ from models import Exchange, Instrument, OrderRequest, OrderResult, PositionSide
 
 logger=logging.getLogger(__name__)
 def _number(v:Decimal)->str:return format(v,"f")
+def _contract_count(v:Decimal)->int:
+    """把带符号的合约张数转成条件单要求的 JSON 整数。
+
+    Gate 的 /futures/usdt/price_orders 把 initial.size 声明为 Go int64，传字符串会被
+    400 AUTO_INVALID_REQUEST_BODY 拒绝（线上表现：开仓已成交但保护单创建失败）。
+    截断方向朝零，因此提交量永远不会超过实际持仓；出现小数张说明进场数量未对齐合约面值，
+    需要人工核对。
+    """
+    count=int(v)
+    if Decimal(count)!=v:logger.warning("Gate 条件单数量 %s 不是整数张，已按 %s 提交，请核对持仓",v,count)
+    return count
 
 class GateAdapter(ExchangeAdapter):
     def __init__(self,config:dict)->None:
@@ -138,7 +149,7 @@ class GateAdapter(ExchangeAdapter):
         r,contracts=self._normalize(r)
         if not r.reduce_only or r.price is None:raise ExchangeError("Gate 保护单必须只减仓并提供触发价")
         size=contracts if r.order_side=="BUY" else -contracts
-        payload={"initial":{"contract":r.instrument.exchange_symbol,"size":_number(size),"price":"0","tif":"ioc","text":"t-"+r.client_order_id[:28],"reduce_only":True},"trigger":{"strategy_type":0,"price_type":1,"price":_number(r.price),"rule":rule,"expiration":86400}}
+        payload={"initial":{"contract":r.instrument.exchange_symbol,"size":_contract_count(size),"price":"0","tif":"ioc","text":"t-"+r.client_order_id[:28],"reduce_only":True},"trigger":{"strategy_type":0,"price_type":1,"price":_number(r.price),"rule":rule,"expiration":86400}}
         return self._result(await self._request("POST","/futures/usdt/price_orders",payload=payload,private=True),r.client_order_id)
     async def place_take_profit(self,r):
         rule=1 if r.position_side==PositionSide.LONG else 2
