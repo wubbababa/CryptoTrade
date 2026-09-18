@@ -17,8 +17,14 @@ from monitor import Monitor
 from notifications import EventNotifier
 from settings import Settings
 from startup_reset import StartupResetter
-from telegram_client import TelegramClient
-from telegram_commands import TelegramCommandHandler, UnknownCommand, parse_command
+from telegram_client import TelegramCallback, TelegramClient
+from telegram_commands import (
+    CommandRejected,
+    CommandReply,
+    TelegramCommandHandler,
+    UnknownCommand,
+    parse_command,
+)
 from trading_service import TradingService
 
 logger = logging.getLogger(__name__)
@@ -34,7 +40,9 @@ class Application:
         self.parser = DeepSeekParser(settings)
         self.service = TradingService(settings, self.database, self.router)
         self.telegram = TelegramClient(settings.raw.get("telegram", {}), self.database)
-        self.command_handler = TelegramCommandHandler(self.database, self.router)
+        # 人工指令入口复用同一个 TradingService：它持有校验器、风控与状态机，
+        # 且所有人工动作都会再次核对 trade_id 与远程订单/仓位后才落库或下单。
+        self.command_handler = TelegramCommandHandler(self.database, self.router, self.service)
         self.notifier = EventNotifier(self.database, self.telegram, settings.raw.get("notifications", {}))
         # 每次启动都会清空本地业务表并以远端持仓重建快照（见 startup_reset 模块文档）。
         self.startup_reset = StartupResetter(self.database, self.router, self.notifier)
@@ -69,7 +77,8 @@ class Application:
         async for message in self.telegram.messages():
             if self.stop_event.is_set():
                 break
-            task = asyncio.create_task(self._handle_message(message), name=f"tg-{message.chat_id}-{message.message_id}")
+            handler = self._handle_callback if isinstance(message, TelegramCallback) else self._handle_message
+            task = asyncio.create_task(handler(message), name=f"tg-{message.chat_id}-{message.message_id if not isinstance(message, TelegramCallback) else message.update_id}")
             self.command_tasks.add(task)
             task.add_done_callback(self.command_tasks.discard)
 
@@ -103,6 +112,36 @@ class Application:
         level = "ERROR" if report.startswith("拒绝执行") else "INFO"
         await self.notifier.emit(level, "COMMAND_RESULT", report, command_id)
 
+    async def _handle_callback(self, callback: TelegramCallback) -> None:
+        """处理内联按钮点击：就地编辑原消息，写操作仍需二次确认。
+
+        按钮点击不进交易公告解析，也不使用 telegram_messages 去重表（按钮更新没有
+        message_id 语义）；幂等由 commands 表的指令编号保证。
+        """
+        command_id = f"tg-cb-{callback.chat_id}-{callback.update_id}"
+        try:
+            reply = await self.command_handler.handle_callback(callback.data)
+            await self.database.audit("TELEGRAM_CALLBACK", command_id, f"OK: {callback.data}")
+        except UnknownCommand:
+            reply = CommandReply(f"未知按钮操作。\n\n" + self.command_handler.help_text(),
+                                 self.command_handler.main_menu())
+            await self.database.audit("TELEGRAM_CALLBACK", command_id, f"UNKNOWN: {callback.data}")
+        except (CommandRejected, ValueError) as exc:
+            # 预期的安全拒绝：回复原因，不打印堆栈。
+            reply = CommandReply(f"按钮操作被拒绝：{exc}", self.command_handler.main_menu())
+            await self.database.audit("TELEGRAM_CALLBACK", command_id, f"REJECTED: {callback.data}: {exc}")
+            logger.info("拒绝 Telegram 按钮操作 %s：%s", callback.data, exc)
+        except Exception as exc:
+            reply = CommandReply(f"按钮操作失败：{exc}", self.command_handler.main_menu())
+            await self.database.audit("TELEGRAM_CALLBACK", command_id, f"FAILED: {callback.data}: {exc}")
+            logger.exception("处理 Telegram 按钮点击失败")
+        # 先应答点击消除加载态，再就地编辑消息，避免用户看到长时间转圈。
+        await self.telegram.answer_callback(callback.callback_id)
+        if callback.message_id is not None:
+            await self.telegram.edit_reply(callback.chat_id, callback.message_id, reply.text, reply.keyboard)
+        else:
+            await self.telegram.reply(callback.chat_id, reply.text, reply.keyboard)
+
     def _is_command(self, message) -> bool:
         """来源频道的非命令文本按公告处理；命令聊天只接收 / 开头文本。"""
         return parse_command(message.text, self.telegram.bot_username) is not None
@@ -113,17 +152,25 @@ class Application:
         name, args = parsed
         command_id = f"tg-{message.chat_id}-{message.message_id}"
         try:
-            reply = await self.command_handler.execute(name, args)
+            reply = await self.command_handler.execute_reply(name, args, command_id)
             await self.database.audit("TELEGRAM_COMMAND", command_id, f"OK: {name}")
         except UnknownCommand:
-            reply = f"未知命令 /{name}。\n\n" + self.command_handler.help_text()
+            reply = CommandReply(f"未知命令 /{name}。\n\n" + self.command_handler.help_text(),
+                                 self.command_handler.main_menu())
             await self.database.audit("TELEGRAM_COMMAND", command_id, f"UNKNOWN: {name}")
+        except (CommandRejected, ValueError) as exc:
+            # 参数不完整、目标无法唯一核对、状态不允许等属于预期的安全拒绝，不是程序缺陷：
+            # 只回复原因并审计，不打印堆栈，避免把正常拒绝噪声成错误日志。
+            # （ValidationError、TradingService 各分支的拒绝都是 ValueError 子类。）
+            reply = CommandReply(f"指令 /{name} 被拒绝：{exc}", self.command_handler.main_menu())
+            await self.database.audit("TELEGRAM_COMMAND", command_id, f"REJECTED: {name}: {exc}")
+            logger.info("拒绝 Telegram 人工指令 /%s：%s", name, exc)
         except Exception as exc:
-            reply = f"命令 /{name} 执行失败：{exc}"
+            reply = CommandReply(f"命令 /{name} 执行失败：{exc}")
             await self.database.audit("TELEGRAM_COMMAND", command_id, f"FAILED: {name}: {exc}")
             logger.exception("处理 Telegram 命令失败")
         # 命令回复直接发回原聊天（管理员私聊或来源频道），不经过配置的回报目标。
-        await self.telegram.reply(message.chat_id, reply)
+        await self.telegram.reply(message.chat_id, reply.text, reply.keyboard)
 
     async def shutdown(self) -> None:
         logger.warning("正在停止接收新指令；交易所端现有订单不会撤销。")

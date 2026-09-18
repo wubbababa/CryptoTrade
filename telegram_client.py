@@ -26,6 +26,17 @@ class TelegramMessage:
     is_source: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class TelegramCallback:
+    """一次内联按钮点击；message_id 用于就地编辑原消息。"""
+
+    update_id: int
+    callback_id: str
+    chat_id: int
+    message_id: int | None
+    data: str
+
+
 class TelegramClient:
     def __init__(self, config: dict, database: Database) -> None:
         self.config = config
@@ -89,11 +100,18 @@ class TelegramClient:
                 for update in updates:
                     self.offset = update["update_id"] + 1
                     await self._save_offset()
+                    callback = self._extract_callback(update)
+                    if callback is not None:
+                        # 按钮点击与命令文本走同一权限边界：来源频道或白名单命令聊天。
+                        if not self._chat_allowed(callback.chat_id, allowed, command_allowed):
+                            continue
+                        yield callback
+                        continue
                     message = update.get("channel_post") or update.get("message")
                     if not message or not message.get("text"):
                         continue
                     chat_id = int(message["chat"]["id"])
-                    is_source = allowed and chat_id in allowed
+                    is_source = bool(allowed) and chat_id in allowed
                     if not is_source:
                         # 非来源频道仅在显式允许且是命令时才放行。
                         if chat_id not in command_allowed or not message["text"].strip().startswith("/"):
@@ -112,7 +130,7 @@ class TelegramClient:
         assert self.session is not None
         async with self.session.get(f"{self.base_url}/getUpdates", params={
             "offset": offset, "timeout": timeout,
-            "allowed_updates": '["message","channel_post","edited_channel_post"]',
+            "allowed_updates": '["message","channel_post","edited_channel_post","callback_query"]',
         }) as response:
             payload = await response.json()
             if not payload.get("ok"):
@@ -132,20 +150,91 @@ class TelegramClient:
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             logger.error("发送 Telegram 回报时网络失败：%s", exc)
 
-    async def reply(self, chat_id: int, text: str) -> None:
-        """把命令回复发回请求所在的聊天；未配置回报目标也照常发送。"""
+    async def reply(self, chat_id: int, text: str,
+                    keyboard: list[list[dict]] | None = None) -> None:
+        """把命令回复发回请求所在的聊天；未配置回报目标也照常发送。
+
+        keyboard 为内联键盘时随消息一起下发，用户点击后 Telegram 会发回 callback_query；
+        同一套命令文本仍可直接手输，按钮只是更省事的入口。
+        """
         if self.session is None:
             logger.info("Telegram 回复（未发送）：%s", text)
             return
+        body: dict = {"chat_id": chat_id, "text": _truncate_for_telegram(text)}
+        if keyboard:
+            body["reply_markup"] = {"inline_keyboard": keyboard}
+        await self._post_send(body)
+
+    async def edit_reply(self, chat_id: int, message_id: int, text: str,
+                         keyboard: list[list[dict]] | None = None) -> None:
+        """就地编辑已有消息，避免按钮点击后刷屏；失败时退化为发送新消息。"""
+        if self.session is None:
+            logger.info("Telegram 编辑（未发送）：%s", text)
+            return
+        body: dict = {"chat_id": chat_id, "message_id": message_id,
+                      "text": _truncate_for_telegram(text)}
+        if keyboard:
+            body["reply_markup"] = {"inline_keyboard": keyboard}
         try:
-            async with self.session.post(f"{self.base_url}/sendMessage",
-                                         json={"chat_id": chat_id, "text": _truncate_for_telegram(text)}) as response:
+            async with self.session.post(f"{self.base_url}/editMessageText", json=body) as response:
+                payload = await response.json()
+            if payload.get("ok"):
+                return
+            description = str(payload.get("description", ""))
+            # 内容未变化时 Telegram 返回 400，无需重发。
+            if "message is not modified" in description:
+                return
+            logger.warning("编辑 Telegram 消息失败，改为发送新消息：%s", description)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.warning("编辑 Telegram 消息网络失败，改为发送新消息：%s", exc)
+        body.pop("message_id", None)
+        await self._post_send(body)
+
+    async def answer_callback(self, callback_id: str, text: str = "") -> None:
+        """应答按钮点击以消除客户端加载态；失败不影响主流程。"""
+        if self.session is None:
+            return
+        try:
+            async with self.session.post(f"{self.base_url}/answerCallbackQuery",
+                                        json={"callback_query_id": callback_id, "text": text[:200]}) as response:
+                await response.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.warning("应答 Telegram 按钮点击失败：%s", exc)
+
+    async def _post_send(self, body: dict) -> None:
+        try:
+            async with self.session.post(f"{self.base_url}/sendMessage", json=body) as response:
                 payload = await response.json()
                 if not payload.get("ok"):
                     # 频道里 Bot 无发言权时退化为日志，避免命令处理因此失败。
                     logger.error("发送 Telegram 回复失败：%s", payload.get("description"))
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             logger.error("发送 Telegram 回复时网络失败：%s", exc)
+
+    @staticmethod
+    def _extract_callback(update: dict) -> TelegramCallback | None:
+        """从 update 中提取按钮点击；非按钮更新返回 None。"""
+        raw = update.get("callback_query")
+        if not raw:
+            return None
+        message = raw.get("message") or {}
+        chat = message.get("chat") or {}
+        if "id" not in chat:
+            return None
+        return TelegramCallback(
+            update_id=int(update["update_id"]),
+            callback_id=str(raw.get("id", "")),
+            chat_id=int(chat["id"]),
+            message_id=int(message["message_id"]) if message.get("message_id") is not None else None,
+            data=str(raw.get("data", "")),
+        )
+
+    @staticmethod
+    def _chat_allowed(chat_id: int, allowed: set, command_allowed: set) -> bool:
+        """按钮点击的权限判定：来源频道或白名单命令聊天。"""
+        if allowed and chat_id in allowed:
+            return True
+        return chat_id in command_allowed
 
     async def _save_offset(self) -> None:
         await self.database.execute(

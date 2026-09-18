@@ -13,8 +13,11 @@ CryptoTrade 是一个由 Telegram 公告/频道信号驱动的多交易所（OKX
 ```mermaid
 flowchart TD
     A[Telegram 频道 / 群组] -->|自然语言公告| B(TelegramClient 轮询抓取)
-    B -->|以 / 开头的只读命令| P[TelegramCommandHandler 状态查询]
-    P -->|仅汇总本地与交易所只读状态| O[运行回报]
+    B -->|以 / 开头的命令| P[TelegramCommandHandler 对话入口]
+    P -->|只读查询：/start /help /status /trades| O[运行回报]
+    P -->|人工指令：/amend_entry /cancel_order /move_stop /close_position| F
+    P -->|内联按钮点击（callback_query）| P
+    P -->|只读按钮/确认后的写按钮| F
     B -->|文本去重与入库| C[(SQLite 数据库)]
     B -->|原始文本| D[DeepSeekParser]
     D -->|调用 DeepSeek API| D1[DeepSeek-V3 / Chat]
@@ -102,8 +105,9 @@ flowchart TD
 | 文件 | 核心类 / 函数 | 职责与功能说明 |
 | :--- | :--- | :--- |
 | [`monitor.py`](file:///f:/projects/CryptoTrade/monitor.py) | `Monitor`, `OrderEvent`, `_first_row`, `_parse_order_event` | **后台监控与启动对账引擎**：系统启动时按数量精确关联本地交易与远程仓位并恢复可监控交易；消费订单/行情事件，触发动态保本与保护单故障通知。`_first_row()` 归一各交易所推送正文形状（Gate 订阅回执的 `result` 是对象而非列表，直接按 `payload[0]` 索引会抛 `KeyError(0)` 并终止整个事件流）；`run_adapter()` 对单条畸形推送只跳过并记录，不再让该交易所的实时策略永久失效。订单推送经 `_parse_order_event()` 统一把成交量换算为标的数量（OKX/Gate 以合约张数成交，直接入库会让本地数量比远程仓位大若干倍，线上表现为「远程仓位=77.54，本地已关联交易数量=775.4；拒绝对汇总仓位执行自动保本」）；同一处仓位归属不一致只写一条审计与一条告警，不再随行情推送逐条刷屏（行情每秒可达十余条）。 |
-| [`telegram_client.py`](file:///f:/projects/CryptoTrade/telegram_client.py) | `TelegramClient` | **Telegram 接口交互**：使用 Telegram Bot API 长轮询接收频道/群组新消息，支持发送交易执行结果回报；来源频道与白名单私聊中的 `/` 开头文本会转交命令层，其余文本仍按交易公告解析。 |
-| [`telegram_commands.py`](file:///f:/projects/CryptoTrade/telegram_commands.py) | `TelegramCommandHandler`, `parse_command`, `UnknownCommand` | **Telegram 只读命令层**：实现 `/start`、`/help`、`/status`，汇总本地交易统计、活动交易、本地活动挂单、各交易所权益与最近指令。**不含任何下单/平仓动作**，交易动作仍只能由来源频道公告经解析与校验后触发。 |
+| [`telegram_client.py`](file:///f:/projects/CryptoTrade/telegram_client.py) | `TelegramClient`, `TelegramCallback` | **Telegram 接口交互**：使用 Telegram Bot API 长轮询接收频道/群组新消息，支持发送交易执行结果回报；来源频道与白名单私聊中的 `/` 开头文本会转交命令层，其余文本仍按交易公告解析。另支持内联按钮：`reply()` 可附带内联键盘，`edit_reply()` 就地刷新消息避免刷屏，`answer_callback()` 应答点击，`_extract_callback()` 把 `callback_query` 归一为 `TelegramCallback`，`_chat_allowed()` 让按钮点击与文本命令共用「来源频道 / 白名单聊天」权限边界。 |
+| [`telegram_commands.py`](file:///f:/projects/CryptoTrade/telegram_commands.py) | `TelegramCommandHandler`, `CommandReply`, `MANUAL_COMMAND_TYPES`, `parse_command`, `parse_price`, `UnknownCommand`, `CommandRejected` | **Telegram 对话命令层（含可点击按钮）**：查询命令 `/start`、`/help`、`/status`、`/trades` 汇总运行状态、活动交易**完整编号**与可用操作、本地活动挂单、各交易所权益与最近指令，并以**内联按钮**下发，可点击执行而不必手抄；人工指令 `/amend_entry`、`/cancel_order`、`/cancel_stop`、`/move_stop`、`/close_position` 既支持手输，也支持按交易点击按钮，统一翻译成 `TradeCommand` 交给 `TradingService`，本层**绝不直接调用交易所适配器**。写操作一律两步：先出确认键盘、再执行；按钮仅允许只读命令与人工指令白名单，伪造回调无法越权。每条人工指令都要求完整 `trade_id`（按钮用 8 位指纹回查，命中 0 条或多条即拒绝），并复用例层「交易所/合约/方向 + 远程订单/持仓唯一关联」的核对。**修改止盈、补仓与「保本离场」改止盈仍未实现**。 |
+| [`telegram_menu.py`](file:///f:/projects/CryptoTrade/telegram_menu.py) | `encode_callback`, `decode_callback`, `fingerprint`, `CallbackAction`, `main_menu_keyboard`, `trades_keyboard`, `confirm_keyboard`, `STATE_ACTIONS` | **Telegram 内联按钮菜单的纯逻辑层**（不依赖 aiohttp，便于单测）：用紧凑 `callback_data`（`cb:` 前缀）编码动作，交易编号以 8 位 SHA-256 指纹塞进 64 字节限制内；按交易状态（`PENDING_ENTRY`/`OPEN`/`WAITING_ADD`）只展示合法动作，避免出现必然被拒绝的按钮；只读/写指令白名单与两步确认文案集中在此，供命令层复用。 |
 | [`database.py`](file:///f:/projects/CryptoTrade/database.py) | `Database` | **SQLite 数据持久化**：启用 WAL 模式和外键约束，管理消息、交易实例、订单、持仓快照、指令与审计日志表。 |
 | [`startup_reset.py`](file:///f:/projects/CryptoTrade/startup_reset.py) | `StartupResetter`, `StartupResetReport`, `run_startup_reset`, `BUSINESS_TABLES` | **启动清库与远端持仓重建**：按需求在**每次启动**时清空本地业务表（`telegram_messages`、`trade_instances`、`orders`、`positions`、`commands`、`exchange_events`），并以交易所为事实来源重建 `positions` 快照。保留 `runtime_state`（Telegram 轮询断点）与 `audit_logs`（审计追溯）。**只读访问交易所**，绝不下单/撤单/平仓；**先拉取、后清空**——所有交易所都读取失败时放弃清空并告警；**不伪造** `trade_instances`/`orders`（`client_order_id` 为 SHA-256 摘要不可反解，止盈止损参数只存在于本地 `commands`，故清库后自动保本对历史交易不再生效）。由 `Application.run()` 在启动对账前自动调用。 |
 
@@ -223,13 +227,13 @@ py -m pytest
 - [`tests/test_telegram_config.py`](file:///f:/projects/CryptoTrade/tests/test_telegram_config.py)：Telegram 配置加载与消息解析验证。
 - [`tests/test_credentials.py`](file:///f:/projects/CryptoTrade/tests/test_credentials.py)：模拟盘与实盘凭据严格隔离测试。
 - [`tests/test_notifications.py`](file:///f:/projects/CryptoTrade/tests/test_notifications.py)：通知审计、级别开关和 Telegram 回报格式测试。
-- [`tests/test_telegram_commands.py`](file:///f:/projects/CryptoTrade/tests/test_telegram_commands.py)：Telegram 只读命令解析与 `/status` 输出内容测试。
+- [`tests/test_telegram_commands.py`](file:///f:/projects/CryptoTrade/tests/test_telegram_commands.py)：Telegram 对话命令层测试：命令解析、`/status` 与 `/trades` 输出、五个人工指令的参数构造与拒绝路径、内联按钮（`callback_data` 64 字节限制、状态过滤、两步确认、指纹唯一性、伪造回调越权拒绝、点击就地编辑消息）、消息分发去重，以及「命令层不直接调用交易所写接口」的安全边界。
 - [`tests/test_cleanup.py`](file:///f:/projects/CryptoTrade/tests/test_cleanup.py)：僵尸交易清理的安全边界测试（有序交易不误清、部分成交不清理、无法核对远程不解锁、dry-run 不写库）。
 - [`tests/test_order_sync.py`](file:///f:/projects/CryptoTrade/tests/test_order_sync.py)：远端→本地挂单同步的安全边界测试（远端仍开放保留挂单、终态回填、零成交收敛、有成交不猜归属、UNTRACKED 只告警、脏状态归一、持仓快照对齐、dry-run 不写库）。
 - [`tests/test_startup_reset.py`](file:///f:/projects/CryptoTrade/tests/test_startup_reset.py)：启动清库的安全边界测试（业务表清空、`runtime_state` 与 `audit_logs` 保留、远端持仓重建、零数量仓位忽略、所有交易所不可读时放弃清空）。
 - [`tests/test_monitor_events.py`](file:///f:/projects/CryptoTrade/tests/test_monitor_events.py)：Monitor 推送解析健壮性测试（Gate 订阅回执为对象形状时不得抛 `KeyError(0)`、形状归一不影响真实推送解析、OKX 无 `data` 回执安全返回 None）。
 
-当前基线：`py -m pytest` 共 **91 项全部通过**（2026-09-17）。注意测试全部基于本地 `PaperAdapter` 或桩替换，**不覆盖真实交易所网络行为**（`credentials.py` 的凭据读取在导入配置阶段即触发，未配置凭据的交易所无法被真实替换），因此真实接口拒单只能靠 `--dev` 实跑或线上对账发现（详见 [`devPLAN.md`](devPLAN.md) §2.1、§3.1）。
+当前基线：`py -m pytest` 共 **133 项全部通过**（2026-09-18）。注意测试全部基于本地 `PaperAdapter` 或桩替换，**不覆盖真实交易所网络行为**（`credentials.py` 的凭据读取在导入配置阶段即触发，未配置凭据的交易所无法被真实替换），因此真实接口拒单只能靠 `--dev` 实跑或线上对账发现（详见 [`devPLAN.md`](devPLAN.md) §2.1、§3.1）。
 
 ---
 
