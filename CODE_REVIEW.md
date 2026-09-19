@@ -24,7 +24,7 @@
 | 编号 | 严重度 | 问题 | 位置 |
 | :--- | :--- | :--- | :--- |
 | P0-1 | 🔴 致命 | ~~部分成交后交易所撤余单，交易被判为 `CANCELLED` 并撤销全部保护单，留下无保护的实盘持仓~~ **✅ 已修复 2026-09-19** | `monitor.py:246-250`、`monitor.py:_handle_entry_terminated` |
-| P0-2 | 🔴 致命 | OKX（`entry_protection_attached=True`）**从不写入保护单记录**，导致改止损/改止盈/取消止损/保本离场/自动保本在 OKX 上全部不可用 | `monitor.py:462-463`、`exchanges/okx.py:155` |
+| P0-2 | 🔴 致命 | ~~OKX（`entry_protection_attached=True`）从不写入保护单记录，导致改止损/改止盈/取消止损/保本离场/自动保本在 OKX 上全部不可用~~ **✅ 已修复 2026-09-20** | `exchanges/okx.py`（改为成交后补建） |
 | P0-3 | 🔴 致命 | 保护单/平仓单的成交回报**完全没有处理**，止损止盈触发后本地永远停留在 `OPEN`；`CLOSING` 状态**无出边**，永久卡死 | `monitor.py:215-221`、`state_manager.py:18`、`trading_service.py:377` |
 | P1-1 | 🟠 高 | 保护单重建使用**确定性 `client_order_id`**，与 `orders.client_order_id UNIQUE` 冲突，重建必然 `IntegrityError` 并把交易锁死 | `monitor.py:531`、`database.py:25` |
 | P1-2 | 🟠 高 | `commands.payload_json` 取「最新一条」且**无 `rowid` 兜底**；SQLite `CURRENT_TIMESTAMP` 只有秒级精度，同秒内多条指令会取错，导致保护单用错价格或直接锁死交易 | `monitor.py:392`、`monitor.py:480` |
@@ -107,7 +107,7 @@ if status not in {"FILLED", "FINISHED"}:
 
 ---
 
-### P0-2 OKX 保护单从不落库，OKX 上的人工保护动作全部不可用 **[已验证]**
+### P0-2 OKX 保护单从不落库，OKX 上的人工保护动作全部不可用 **[已验证] [已修复 2026-09-20]**
 
 **位置**：`monitor.py:460-463`
 
@@ -147,6 +147,47 @@ breakeven_triggered: 0 ; BREAKEVEN audits: []
 **建议**：OKX 成交时同步把 `attachAlgoOrds` 的 `algoId` 落库（`order-algo` / 订单详情返回），
 或退化为「成交后显式查询并登记保护单」。**不要用 `entry_protection_attached` 绕过本地跟踪**——
 该标志只应决定「是否需要新建」，不应决定「是否需要记录」。
+
+---
+
+
+**修复说明（2026-09-20）**：改为**成交后分别补建止盈与止损**，与 Binance/Gate 共用同一条已验证路径（`monitor._ensure_protection`），而不再依赖 OKX 的原子附带保护。
+
+为何不选择「把 attachAlgoOrds 的 algoId 登记到本地」：OKX 的附带保护是**单个 OCO 算法单**，止盈与止损共享同一个 `algoId`。一旦「取消止损」就会连带撤掉止盈，满足不了本项目的人工指令语义（取消止损但保留止盈、只改止损不动止盈）。交易所级别的 OCO 语义与本项目的模型不匹配，因此选择在本地手机侧拆成两张独立保护单。
+
+改动点：
+
+| 位置 | 改动 |
+| :--- | :--- |
+| `exchanges/okx.py` `entry_protection_attached` | `True` → `False` |
+| `exchanges/okx.py` `_regular()` | 不再注入 `attachAlgoOrds`，保护价改由 Monitor 补建 |
+| `exchanges/okx.py` `_conditional()` | 回传 `algoClOrdId`，使本地编号能与远程挂单关联 |
+| `exchanges/okx.py` `get_open_orders()` | 合并 `/trade/orders-algo-pending`，否则保护单瘾形 |
+| `exchanges/okx.py` `cancel_order()` | 算法单路由到 `/trade/cancel-algos`（普通单仍走 `cancel-order`） |
+| `exchanges/okx.py` `get_order()` | 增加算法单回查后备，供 order_sync 收敛 |
+| `trading_service.py` `_open()` | 仅对原子附带型适配器注入保护价 |
+
+回归用例（`tests/test_okx_errors.py`）：
+
+| 用例 | 断言 |
+| :--- | :--- |
+| `test_okx_entry_order_does_not_attach_protection` | 进场单不得携带 `attachAlgoOrds` |
+| `test_okx_adapter_declares_deferred_protection` | `entry_protection_attached is False` |
+| `test_okx_conditional_order_sends_algo_client_id` | 算法单必须带 `algoClOrdId` 并登记为算法单 |
+| `test_okx_open_orders_include_algo_orders` | `get_open_orders` 必须合并算法单 |
+| `test_okx_cancel_routes_algo_orders_to_cancel_algos` | 算法单路由到 `cancel-algos` |
+| `test_okx_protection_orders_are_registered_and_manageable` | 端到端：成交后登记保护单、改止损/改止盈/取消止损均可用、对账一致 |
+
+修复后实测（真实 `OKXAdapter` + mock HTTP）：
+
+```
+ state: OPEN
+ reconcile warnings: []                       # 修复前会报「远程数据和本地数据库挂单状态不一致」
+ 本地保护单: TAKE_PROFIT(独立 algoId) + STOP_LOSS(独立 algoId)
+ move_stop / amend_take_profit / cancel_stop 全部执行成功
+ cancel_stop 后: WAITING_ADD，且止盈仍为 NEW   # OKX 旧 OCO 语义会连带撤掉止盈
+ breakeven_triggered = 1                      # 自动保本已接手
+```
 
 ---
 
@@ -365,7 +406,7 @@ with rowid tiebreak                     : amend
 | 顺序 | 内容 | 理由 |
 | :--- | :--- | :--- |
 | 1 | ~~**P0-1** 部分成交撤单不得判 `CANCELLED`~~ **✅ 已修复** | 2026-09-19：`_handle_entry_terminated()` 改为按成交事实收敛，附 3 条回归用例 |
-| 2 | **P0-2** OKX 保护单落库 | 主交易所的核心功能整体失效 |
+| 2 | ~~**P0-2** OKX 保护单落库~~ **✅ 已修复** | 2026-09-20：改为成交后分别补建，附 6 条回归用例 |
 | 3 | **P0-3** 保护单/平仓单成交处理 + `CLOSING` 收敛 | 状态机与事实脱节，误导人工决策 |
 | 4 | **P1-1 / P1-3** 保护单编号唯一性 + 事件重放幂等 | 重启恢复与 WS 重连下的必然故障 |
 | 5 | **P1-2** 保护参数快照化（替代「最新指令」） | 根治保护单价格来源不可靠 |
@@ -396,5 +437,5 @@ await monitor.process_event(Exchange.BINANCE, adapter, {
 })
 ```
 
-其中 **P0-1 已于 2026-09-19 修复并固化为 3 条回归用例**；建议继续将 P0-2、P0-3、P1-1、P1-3 固化为 `tests/` 下的回归用例，
+其中 **P0-1 已于 2026-09-19 修复并固化为 3 条回归用例**；P0-2 亦已于 2026-09-20 修复并固化为 6 条回归用例；建议继续将 P0-3、P1-1、P1-3 固化为 `tests/` 下的回归用例，
 它们共同覆盖了当前测试矩阵中缺失的「成交后生命周期」区域。

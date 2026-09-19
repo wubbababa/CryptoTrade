@@ -399,8 +399,11 @@ class TradingService:
             raise ValueError(f"{command.exchange.value} 不支持 {command.instrument_key}")
         entry_price = command.entry.low if command.side == PositionSide.LONG else command.entry.high
         client_id = self._client_order_id(command, "ENTRY")
-        tp_price = command.take_profits[0] if command.take_profits else None
-        sl_price = command.stop_loss
+        # 只有「开仓原子附带保护单」的交易所才把止盈止损放进进场请求；其余交易所一律在成交后
+        # 由 Monitor 按真实持仓补建（见 monitor._ensure_protection），避免保护价被静默忽略。
+        attached = adapter.entry_protection_attached
+        tp_price = (command.take_profits[0] if command.take_profits else None) if attached else None
+        sl_price = command.stop_loss if attached else None
         request = OrderRequest(
             instrument=instrument,
             position_side=command.side,

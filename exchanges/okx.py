@@ -43,12 +43,24 @@ class OKXAdapter(ExchangeAdapter):
         self.session: aiohttp.ClientSession | None = None
         self.instruments: dict[str, Instrument] = {}
         self.order_symbols: dict[str, str] = {}
+        # 已确认为算法/条件单的订单编号（成交后补建的止盈止损走 order-algo 接口，
+        # 撤销与查询必须用 cancel-algos / order-algo，不能走普通订单接口）。
+        self.algo_orders: set[str] = set()
         self._closed, self._leverage_set = False, set()
 
     @property
     def entry_protection_attached(self) -> bool:
-        """OKX 的 attachAlgoOrds 与开仓订单由同一请求提交。"""
-        return True
+        """OKX 不使用「开仓原子附带保护单」，改为成交后分别补建止盈与止损。
+
+        原因：OKX 的 attachAlgoOrds 把同一笔进场单的止盈与止损绑成一个 OCO 算法单，
+        两者共享同一个 algoId，一旦「取消止损」就会连带撤掉止盈，无法满足本项目
+        「取消止损但保留止盈」「改止损而不动止盈」等人工指令语义。
+        另外附带保护单此前从不写入本地 orders 表，导致改止损/改止盈/取消止损/
+        保本离场/自动保本在 OKX 上全部不可用（因为下游一律按 orders 表定位远程订单）。
+        改为成交后补建后，每张保护单都有独立 algoId，上述功能与 Binance/Gate 走同一条
+        已验证路径（见 monitor._ensure_protection）。
+        """
+        return False
 
     async def resolve_leverage(self, instrument: Instrument, requested: Decimal,
                                margin_mode: str) -> Decimal:
@@ -151,13 +163,40 @@ class OKXAdapter(ExchangeAdapter):
         "mmp_canceled": "CANCELED",
     }
 
+    # OKX 算法/条件单状态到系统标准状态的映射。
+    _ALGO_STATE_MAP = {
+        "live": "NEW",
+        "pause": "NEW",
+        "effective": "NEW",
+        "canceled": "CANCELED",
+        "order_failed": "REJECTED",
+        "completed": "FILLED",
+    }
+
     async def get_open_orders(self) -> list[OrderResult]:
+        """返回普通挂单与算法/条件单。
+
+        成交后补建的止盈止损通过 ``/trade/order-algo`` 创建，**不会**出现在
+        ``/trade/orders-pending`` 中。若不单独拉取 ``orders-algo-pending``，
+        人工改单/撤单与自动保本都会报「活动保护单未在交易所开放订单中，拒绝猜测」，
+        即保护单在本地不可见。因此这里把两类挂单一并归一后返回。
+        """
         rows = await self._request("GET", "/api/v5/trade/orders-pending", {"instType":"SWAP"})
         results = []
         for row in rows:
             self.order_symbols[row["ordId"]] = row["instId"]
             results.append(OrderResult(row["ordId"], row.get("clOrdId", ""),
                                        self._STATE_MAP.get(row.get("state", ""), row.get("state", "")), row))
+        algo_rows = await self._request("GET", "/api/v5/trade/orders-algo-pending", {"instType":"SWAP"})
+        for row in algo_rows:
+            algo_id = str(row.get("algoId", ""))
+            if not algo_id:
+                continue
+            self.order_symbols[algo_id] = row.get("instId", "")
+            self.algo_orders.add(algo_id)
+            state = str(row.get("state", ""))
+            results.append(OrderResult(algo_id, row.get("algoClOrdId", "") or row.get("clOrdId", ""),
+                                       self._ALGO_STATE_MAP.get(state, state.upper()), row))
         return results
 
     async def get_order(self, client_order_id: str, exchange_order_id: str | None = None,
@@ -198,6 +237,29 @@ class OKXAdapter(ExchangeAdapter):
                 state = str(row.get("state", ""))
                 return OrderResult(str(row.get("ordId", "")), str(row.get("clOrdId") or client_order_id),
                                    self._STATE_MAP.get(state, state.upper()), row)
+        # 普通订单接口查不到时，回退算法单接口：成交后补建的保护单只在 order-algo 侧可查。
+        if exchange_order_id and str(exchange_order_id).isdigit():
+            for algo_key in ("algoId", "algoClOrdId"):
+                value = str(exchange_order_id) if algo_key == "algoId" else str(client_order_id)
+                if not value:
+                    continue
+                algo_query = dict(params, **{algo_key: value})
+                try:
+                    rows = await self._request("GET", "/api/v5/trade/order-algo", algo_query)
+                except ExchangeError as exc:
+                    if "51110" not in str(exc) and "51603" not in str(exc):
+                        raise
+                    continue
+                if rows:
+                    row = rows[0]
+                    algo_id = str(row.get("algoId", ""))
+                    if algo_id:
+                        self.order_symbols[algo_id] = row.get("instId", "")
+                        self.algo_orders.add(algo_id)
+                    state = str(row.get("state", ""))
+                    return OrderResult(algo_id or str(exchange_order_id),
+                                       str(row.get("algoClOrdId") or client_order_id),
+                                       self._ALGO_STATE_MAP.get(state, state.upper()), row)
         return None
 
     async def get_positions(self) -> list[PositionSnapshot]:
@@ -280,18 +342,15 @@ class OKXAdapter(ExchangeAdapter):
             "clOrdId":request.client_order_id}
         if request.price is not None: payload["px"] = _number(request.price)
         if request.reduce_only: payload["reduceOnly"] = "true"
-        # 注入开仓附带止盈止损参数（OKX V5 最新规范使用 attachAlgoOrds 数组，Mark 标记价触发，市价平仓）
-        attach_algo: dict[str, str] = {}
-        if request.take_profit_price is not None:
-            attach_algo["tpTriggerPx"] = _number(request.take_profit_price)
-            attach_algo["tpOrdPx"] = "-1"
-            attach_algo["tpTriggerPxType"] = "mark"
-        if request.stop_loss_price is not None:
-            attach_algo["slTriggerPx"] = _number(request.stop_loss_price)
-            attach_algo["slOrdPx"] = "-1"
-            attach_algo["slTriggerPxType"] = "mark"
-        if attach_algo:
-            payload["attachAlgoOrds"] = [attach_algo]
+        # 这里**故意不**注入 attachAlgoOrds：OKX 的附带保护是单个 OCO 算法单（止盈止损共享
+        # 一个 algoId），无法支持「取消止损但保留止盈」「只改止损不动止盈」等人工语义，
+        # 且附带单不会出现在 orders-pending / orders-algo-pending 中而不被本地登记。
+        # 保护单统一由 Monitor 在成交后按真实持仓分别补建（见 entry_protection_attached）。
+        if request.take_profit_price is not None or request.stop_loss_price is not None:
+            logger.warning(
+                "OKX 忽略进场单携带的保护价（止盈=%s 止损=%s）：OKX 改为成交后补建独立保护单",
+                request.take_profit_price, request.stop_loss_price,
+            )
         return self._result(await self._request("POST", "/api/v5/trade/order", payload=payload),
                             request.client_order_id, request.instrument.exchange_symbol)
 
@@ -305,9 +364,15 @@ class OKXAdapter(ExchangeAdapter):
                             request.client_order_id, request.instrument.exchange_symbol)
 
     async def cancel_order(self, order_id: str) -> OrderResult:
+        """撤销普通挂单或算法/条件单；两者使用的接口不同，必须按类型分流。"""
         if order_id not in self.order_symbols: await self.get_open_orders()
         symbol = self.order_symbols.get(order_id)
         if not symbol: raise ExchangeError("无法确定 OKX 订单所属合约")
+        if order_id in getattr(self, "algo_orders", set()):
+            # 算法单必须用 cancel-algos（请求体为数组），用 cancel-order 会被 OKX 拒绝。
+            result = self._result(await self._request("POST","/api/v5/trade/cancel-algos",
+                payload=[{"instId":symbol,"algoId":order_id}]), "", symbol)
+            return replace(result, status="CANCELED")
         result = self._result(await self._request("POST","/api/v5/trade/cancel-order",
             payload={"instId":symbol,"ordId":order_id}), "", symbol)
         return replace(result, status="CANCELED")
@@ -315,11 +380,19 @@ class OKXAdapter(ExchangeAdapter):
     async def _conditional(self, request: OrderRequest, prefix: str) -> OrderResult:
         request, size = self._normalize(request)
         if not request.reduce_only or request.price is None: raise ExchangeError("OKX 保护单必须只减仓并提供触发价")
+        if not re.fullmatch(r"[A-Za-z0-9]{1,32}", request.client_order_id):
+            raise ExchangeError("OKX algoClOrdId 必须为 1–32 位英文字母或数字")
         payload = {"instId":request.instrument.exchange_symbol,"tdMode":request.margin_mode.lower(),
             "side":request.order_side.lower(),"ordType":"conditional","sz":size,"reduceOnly":"true",
+            # 必须回传客户端编号：本地 orders 表以 client_order_id 与远程挂单做唯一关联，
+            # 缺少它时后续改单/撤单/自动保本都会报「未在交易所开放订单中，拒绝猜测」。
+            "algoClOrdId":request.client_order_id,
             f"{prefix}TriggerPx":_number(request.price),f"{prefix}OrdPx":"-1",f"{prefix}TriggerPxType":"mark"}
-        return self._result(await self._request("POST","/api/v5/trade/order-algo",payload=payload),
-                            request.client_order_id, request.instrument.exchange_symbol)
+        result = self._result(await self._request("POST","/api/v5/trade/order-algo",payload=payload),
+                              request.client_order_id, request.instrument.exchange_symbol)
+        if result.exchange_order_id:
+            self.algo_orders.add(result.exchange_order_id)
+        return result
 
     async def place_take_profit(self, request: OrderRequest) -> OrderResult: return await self._conditional(request,"tp")
     async def place_stop_loss(self, request: OrderRequest) -> OrderResult: return await self._conditional(request,"sl")
