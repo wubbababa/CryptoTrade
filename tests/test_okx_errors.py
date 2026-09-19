@@ -166,6 +166,7 @@ def test_okx_open_orders_include_algo_orders():
         if path == "/api/v5/trade/orders-pending":
             return [{"ordId": "okx-entry-1", "instId": "ETH-USDT-SWAP", "clOrdId": "ctEntry01", "state": "live"}]
         if path == "/api/v5/trade/orders-algo-pending":
+            assert params == {"instType": "SWAP", "ordType": "conditional"}
             return [{"algoId": "okx-algo-1", "instId": "ETH-USDT-SWAP",
                      "algoClOrdId": "ctProtection01", "state": "live"}]
         raise AssertionError("意外的请求路径：" + path)

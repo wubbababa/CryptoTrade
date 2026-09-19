@@ -187,7 +187,9 @@ class OKXAdapter(ExchangeAdapter):
             self.order_symbols[row["ordId"]] = row["instId"]
             results.append(OrderResult(row["ordId"], row.get("clOrdId", ""),
                                        self._STATE_MAP.get(row.get("state", ""), row.get("state", "")), row))
-        algo_rows = await self._request("GET", "/api/v5/trade/orders-algo-pending", {"instType":"SWAP"})
+        # OKX 要求算法单查询显式指定类型；本项目保护单统一使用 conditional。
+        algo_rows = await self._request("GET", "/api/v5/trade/orders-algo-pending",
+                                        {"instType":"SWAP", "ordType":"conditional"})
         for row in algo_rows:
             algo_id = str(row.get("algoId", ""))
             if not algo_id:
