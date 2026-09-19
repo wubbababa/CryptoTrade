@@ -910,3 +910,301 @@ def audit_result_of(audits):
     """提取唯一一条审计结论，便于断言且避免索引硬编码。"""
     assert len(audits) == 1, f"期望恰好一条审计，实际 {audits}"
     return audits[0]["result"]
+
+def test_stop_loss_fill_closes_trade_and_stops_breakeven(settings):
+    """P0-3 回归：止损在交易所触发后，交易必须收敛为 CLOSED 并停用自动保本。
+
+    旧实现只处理 ENTRY/ADD_ENTRY 的成交回报，止盈/止损/平仓单的回报被当成未知订单
+    丢弃，交易永远停在 OPEN，`/trades` 继续把已结束的交易列为活动交易。
+    """
+    class DeferredProtectionPaperAdapter(PaperAdapter):
+        @property
+        def entry_protection_attached(self) -> bool:
+            return False
+
+    async def scenario():
+        database = Database(settings.database_path)
+        database.initialize()
+        router = ExchangeRouter(settings)
+        original = router.get(Exchange.BINANCE)
+        adapter = DeferredProtectionPaperAdapter(original.instruments, original.equity)
+        router.adapters[Exchange.BINANCE] = adapter
+        command = command_from_json(valid_payload(), "tg-p03-stop", settings)
+        await TradingService(settings, database, router).execute(command)
+        entry = (await database.fetch_all("SELECT * FROM orders WHERE order_type='ENTRY'"))[0]
+        quantity = Decimal(entry["quantity"])
+        adapter.positions = [PositionSnapshot(
+            Exchange.BINANCE, command.instrument_key, command.side, quantity, Decimal("2480"))]
+        monitor = Monitor(router, database)
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {
+                "c": entry["client_order_id"], "X": "FILLED", "z": str(quantity), "ap": "2480"}}})
+        assert (await database.fetch_all("SELECT state FROM trade_instances"))[0]["state"] == "OPEN"
+
+        # 止损在交易所被触发：仓位被清空，止损单完全成交。
+        stop = (await database.fetch_all("SELECT * FROM orders WHERE order_type='STOP_LOSS'"))[0]
+        adapter.positions = []
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {
+                "c": stop["client_order_id"], "X": "FILLED", "z": str(quantity), "ap": "2455"}}})
+
+        trade = (await database.fetch_all("SELECT state,breakeven_triggered FROM trade_instances"))[0]
+        stop_row = (await database.fetch_all(
+            "SELECT status,filled_quantity FROM orders WHERE order_type='STOP_LOSS'"))[0]
+        stale = await database.fetch_all(
+            "SELECT order_type,status FROM orders WHERE order_type='TAKE_PROFIT'")
+        audits = await database.fetch_all(
+            "SELECT result FROM audit_logs WHERE category='TRADE_CLOSED_BY_FILL'")
+        await router.close()
+        return trade, stop_row, stale, audits
+
+    trade, stop_row, stale, audits = asyncio.run(scenario())
+    assert trade["state"] == "CLOSED"
+    # 停用自动保本，避免继续对已清空的仓位推止损。
+    assert trade["breakeven_triggered"] == 1
+    # 止损单自身必须如实落库为完全成交。
+    assert stop_row["status"] == "FILLED"
+    assert Decimal(stop_row["filled_quantity"]) > 0
+    # 已无意义的残留止盈记录应被收敛为 CANCELED（只改本地，不触碰交易所）。
+    assert [row["status"] for row in stale] == ["CANCELED"]
+    assert audits and audits[0]["result"] == "STOP_LOSS"
+
+
+def test_reducing_fill_is_idempotent_on_repeated_push(settings):
+    """P0-3 回归：WebSocket 重连重放同一条减仓成交回报不得改变终态或重复告警。"""
+    class DeferredProtectionPaperAdapter(PaperAdapter):
+        @property
+        def entry_protection_attached(self) -> bool:
+            return False
+
+    async def scenario():
+        database = Database(settings.database_path)
+        database.initialize()
+        router = ExchangeRouter(settings)
+        original = router.get(Exchange.BINANCE)
+        adapter = DeferredProtectionPaperAdapter(original.instruments, original.equity)
+        router.adapters[Exchange.BINANCE] = adapter
+        command = command_from_json(valid_payload(), "tg-p03-idem", settings)
+        await TradingService(settings, database, router).execute(command)
+        entry = (await database.fetch_all("SELECT * FROM orders WHERE order_type='ENTRY'"))[0]
+        quantity = Decimal(entry["quantity"])
+        adapter.positions = [PositionSnapshot(
+            Exchange.BINANCE, command.instrument_key, command.side, quantity, Decimal("2480"))]
+        monitor = Monitor(router, database)
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {
+                "c": entry["client_order_id"], "X": "FILLED", "z": str(quantity), "ap": "2480"}}})
+        stop = (await database.fetch_all("SELECT * FROM orders WHERE order_type='STOP_LOSS'"))[0]
+        adapter.positions = []
+        event = {"data": {"e": "ORDER_TRADE_UPDATE", "o": {
+            "c": stop["client_order_id"], "X": "FILLED", "z": str(quantity), "ap": "2455"}}}
+        await monitor.process_event(Exchange.BINANCE, adapter, event)
+        await monitor.process_event(Exchange.BINANCE, adapter, event)
+        await monitor.process_event(Exchange.BINANCE, adapter, event)
+        trade = (await database.fetch_all("SELECT state FROM trade_instances"))[0]
+        audits = await database.fetch_all(
+            "SELECT result FROM audit_logs WHERE category='TRADE_CLOSED_BY_FILL'")
+        await router.close()
+        return trade, audits
+
+    trade, audits = asyncio.run(scenario())
+    assert trade["state"] == "CLOSED"
+    # 幂等：重放不得写出多条收敛审计。
+    assert len(audits) == 1
+
+
+def test_canceled_reducing_order_keeps_trade_open(settings):
+    """P0-3 回归：止盈/止损被撤销（非成交）不改变持仓，交易必须保持 OPEN。"""
+    class DeferredProtectionPaperAdapter(PaperAdapter):
+        @property
+        def entry_protection_attached(self) -> bool:
+            return False
+
+    async def scenario():
+        database = Database(settings.database_path)
+        database.initialize()
+        router = ExchangeRouter(settings)
+        original = router.get(Exchange.BINANCE)
+        adapter = DeferredProtectionPaperAdapter(original.instruments, original.equity)
+        router.adapters[Exchange.BINANCE] = adapter
+        command = command_from_json(valid_payload(), "tg-p03-cancel", settings)
+        await TradingService(settings, database, router).execute(command)
+        entry = (await database.fetch_all("SELECT * FROM orders WHERE order_type='ENTRY'"))[0]
+        quantity = Decimal(entry["quantity"])
+        adapter.positions = [PositionSnapshot(
+            Exchange.BINANCE, command.instrument_key, command.side, quantity, Decimal("2480"))]
+        monitor = Monitor(router, database)
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {
+                "c": entry["client_order_id"], "X": "FILLED", "z": str(quantity), "ap": "2480"}}})
+        tp = (await database.fetch_all("SELECT * FROM orders WHERE order_type='TAKE_PROFIT'"))[0]
+        # 止盈单被撤销：仓位仍在，交易不得被收敛。
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {"c": tp["client_order_id"], "X": "CANCELED"}}})
+        trade = (await database.fetch_all("SELECT state,breakeven_triggered FROM trade_instances"))[0]
+        tp_row = (await database.fetch_all(
+            "SELECT status FROM orders WHERE order_type='TAKE_PROFIT'"))[0]
+        await router.close()
+        return trade, tp_row
+
+    trade, tp_row = asyncio.run(scenario())
+    assert trade["state"] == "OPEN"
+    assert trade["breakeven_triggered"] == 0
+    assert tp_row["status"] == "CANCELED"
+
+
+def test_close_position_fill_converges_closing_to_closed(settings):
+    """P0-3 回归：市价平仓受理后为 CLOSING，平仓单成交必须收敛为 CLOSED。
+
+    旧实现下 CLOSING 没有出边，交易永久卡在活动列表；且平仓单从不落库，
+    其成交回报无法与交易关联。
+    """
+    class DeferredProtectionPaperAdapter(PaperAdapter):
+        @property
+        def entry_protection_attached(self) -> bool:
+            return False
+
+    async def scenario():
+        database = Database(settings.database_path)
+        database.initialize()
+        router = ExchangeRouter(settings)
+        original = router.get(Exchange.BINANCE)
+        adapter = DeferredProtectionPaperAdapter(original.instruments, original.equity)
+        router.adapters[Exchange.BINANCE] = adapter
+        service = TradingService(settings, database, router)
+        command = command_from_json(valid_payload(), "tg-p03-close", settings)
+        await service.execute(command)
+        entry = (await database.fetch_all("SELECT * FROM orders WHERE order_type='ENTRY'"))[0]
+        quantity = Decimal(entry["quantity"])
+        adapter.positions = [PositionSnapshot(
+            Exchange.BINANCE, command.instrument_key, command.side, quantity, Decimal("2480"))]
+        monitor = Monitor(router, database)
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {
+                "c": entry["client_order_id"], "X": "FILLED", "z": str(quantity), "ap": "2480"}}})
+        trade_id = (await database.fetch_all("SELECT trade_id FROM trade_instances"))[0]["trade_id"]
+
+        close_payload = valid_payload()
+        close_payload.update({"command_type": "CLOSE_POSITION", "trade_id": trade_id,
+                              "entry": None, "take_profits": [], "stop_loss": None})
+        report = await service.execute(command_from_json(close_payload, "tg-p03-close-cmd", settings))
+        after_accept = (await database.fetch_all("SELECT state FROM trade_instances"))[0]["state"]
+        # 平仓单必须落库，否则成交回报无法关联。
+        close_row = (await database.fetch_all("SELECT * FROM orders WHERE order_type='CLOSE'"))[0]
+
+        adapter.positions = []
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {
+                "c": close_row["client_order_id"], "X": "FILLED",
+                "z": str(quantity), "ap": "2500"}}})
+        final = (await database.fetch_all("SELECT state,breakeven_triggered FROM trade_instances"))[0]
+        close_final = (await database.fetch_all(
+            "SELECT status FROM orders WHERE order_type='CLOSE'"))[0]
+        await router.close()
+        return report, after_accept, close_row, final, close_final
+
+    report, after_accept, close_row, final, close_final = asyncio.run(scenario())
+    assert "已提交市价平仓" in report
+    assert after_accept == "CLOSING"
+    # 平仓单在受理阶段就已落库（含客户订单号），否则回报将无处匹配。
+    assert close_row["client_order_id"]
+    assert final["state"] == "CLOSED"
+    assert final["breakeven_triggered"] == 1
+    assert close_final["status"] == "FILLED"
+
+
+def test_closed_trade_leaves_active_list_and_actions(settings):
+    """P0-3 回归：收敛为 CLOSED 后不得再出现在活动交易与可用动作里。"""
+    from telegram_commands import TelegramCommandHandler
+    from telegram_menu import available_actions
+
+    class DeferredProtectionPaperAdapter(PaperAdapter):
+        @property
+        def entry_protection_attached(self) -> bool:
+            return False
+
+    async def scenario():
+        database = Database(settings.database_path)
+        database.initialize()
+        router = ExchangeRouter(settings)
+        original = router.get(Exchange.BINANCE)
+        adapter = DeferredProtectionPaperAdapter(original.instruments, original.equity)
+        router.adapters[Exchange.BINANCE] = adapter
+        command = command_from_json(valid_payload(), "tg-p03-list", settings)
+        await TradingService(settings, database, router).execute(command)
+        entry = (await database.fetch_all("SELECT * FROM orders WHERE order_type='ENTRY'"))[0]
+        quantity = Decimal(entry["quantity"])
+        adapter.positions = [PositionSnapshot(
+            Exchange.BINANCE, command.instrument_key, command.side, quantity, Decimal("2480"))]
+        monitor = Monitor(router, database)
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {
+                "c": entry["client_order_id"], "X": "FILLED", "z": str(quantity), "ap": "2480"}}})
+        stop = (await database.fetch_all("SELECT * FROM orders WHERE order_type='STOP_LOSS'"))[0]
+        adapter.positions = []
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {
+                "c": stop["client_order_id"], "X": "FILLED", "z": str(quantity), "ap": "2455"}}})
+        handler = TelegramCommandHandler(database, router)
+        text = await handler.trades_text()
+        await router.close()
+        return text
+
+    text = asyncio.run(scenario())
+    assert "当前没有活动交易" in text
+    # CLOSED 属于终态，不应再出现任何可写动作按钮。
+    assert available_actions("CLOSED") == ()
+
+def test_rejected_close_order_reverts_closing_to_open(settings):
+    """P0-3 回归：平仓单被交易所拒绝时，交易必须从 CLOSING 退回 OPEN，不得卡死。
+
+    仓位此时仍然存在；若把交易留在 CLOSING，它既不在终态集合（一直显示为活动交易），
+    也不满足任何人工动作的状态前置条件（改止损/平仓都要求 OPEN）。
+    """
+    class DeferredProtectionPaperAdapter(PaperAdapter):
+        @property
+        def entry_protection_attached(self) -> bool:
+            return False
+
+    async def scenario():
+        database = Database(settings.database_path)
+        database.initialize()
+        router = ExchangeRouter(settings)
+        original = router.get(Exchange.BINANCE)
+        adapter = DeferredProtectionPaperAdapter(original.instruments, original.equity)
+        router.adapters[Exchange.BINANCE] = adapter
+        service = TradingService(settings, database, router)
+        command = command_from_json(valid_payload(), "tg-p03-rej", settings)
+        await service.execute(command)
+        entry = (await database.fetch_all("SELECT * FROM orders WHERE order_type='ENTRY'"))[0]
+        quantity = Decimal(entry["quantity"])
+        adapter.positions = [PositionSnapshot(
+            Exchange.BINANCE, command.instrument_key, command.side, quantity, Decimal("2480"))]
+        monitor = Monitor(router, database)
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {
+                "c": entry["client_order_id"], "X": "FILLED", "z": str(quantity), "ap": "2480"}}})
+        trade_id = (await database.fetch_all("SELECT trade_id FROM trade_instances"))[0]["trade_id"]
+
+        close_payload = valid_payload()
+        close_payload.update({"command_type": "CLOSE_POSITION", "trade_id": trade_id,
+                              "entry": None, "take_profits": [], "stop_loss": None})
+        await service.execute(command_from_json(close_payload, "tg-p03-rej-cmd", settings))
+        assert (await database.fetch_all("SELECT state FROM trade_instances"))[0]["state"] == "CLOSING"
+
+        # 平仓单被拒绝，仓位仍然存在。
+        close_row = (await database.fetch_all("SELECT * FROM orders WHERE order_type='CLOSE'"))[0]
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {
+                "c": close_row["client_order_id"], "X": "REJECTED"}}})
+        trade = (await database.fetch_all("SELECT state,breakeven_triggered FROM trade_instances"))[0]
+        audits = await database.fetch_all(
+            "SELECT result FROM audit_logs WHERE category='CLOSE_POSITION'")
+        await router.close()
+        return trade, audits
+
+    trade, audits = asyncio.run(scenario())
+    assert trade["state"] == "OPEN"
+    # 持仓仍在，自动保本不应被停用。
+    assert trade["breakeven_triggered"] == 0
+    assert any(str(row["result"]).startswith("NOT_FILLED") for row in audits)

@@ -13,8 +13,11 @@ ALLOWED_TRANSITIONS: dict[TradeState, set[TradeState]] = {
     TradeState.RECEIVED: {TradeState.PENDING_ENTRY, TradeState.REJECTED},
     TradeState.PENDING_ENTRY: {TradeState.PARTIAL_FILL, TradeState.OPEN, TradeState.CANCELLED, TradeState.ERROR_LOCKED},
     TradeState.PARTIAL_FILL: {TradeState.OPEN, TradeState.CANCELLED, TradeState.ERROR_LOCKED},
-    TradeState.OPEN: {TradeState.WAITING_ADD, TradeState.CLOSING, TradeState.ERROR_LOCKED},
-    TradeState.WAITING_ADD: {TradeState.OPEN, TradeState.ERROR_LOCKED},
+    # OPEN 同时保留 CLOSED 与 CLOSING 两条出边：
+    # - CLOSED：止盈/止损在交易所被触发（保护单成交回报直接终结交易，不经 CLOSING）；
+    # - CLOSING：人工市价平仓已受理，等待平仓单成交回报后收敛为 CLOSED。
+    TradeState.OPEN: {TradeState.WAITING_ADD, TradeState.CLOSING, TradeState.CLOSED, TradeState.ERROR_LOCKED},
+    TradeState.WAITING_ADD: {TradeState.OPEN, TradeState.CLOSED, TradeState.ERROR_LOCKED},
     TradeState.CLOSING: {TradeState.CLOSED, TradeState.ERROR_LOCKED},
 }
 

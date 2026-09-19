@@ -94,6 +94,26 @@ class TradeState(StringEnum):
     ERROR_LOCKED = "ERROR_LOCKED"
 
 
+class OrderType(StringEnum):
+    """本地 orders 表的订单用途分类。
+
+    进场与补仓属于「开仓方向」，止盈/止损/平仓属于「只减仓方向」；
+    Monitor 处理成交回报时必须先看用途再决定状态收敛方向。
+    """
+
+    ENTRY = "ENTRY"
+    ADD_ENTRY = "ADD_ENTRY"
+    TAKE_PROFIT = "TAKE_PROFIT"
+    STOP_LOSS = "STOP_LOSS"
+    CLOSE = "CLOSE"
+
+
+# 开仓方向的订单类型（成交会建立/扩大持仓）。
+OPENING_ORDER_TYPES = (OrderType.ENTRY.value, OrderType.ADD_ENTRY.value)
+
+# 只减仓方向的订单类型（成交会缩减/清空持仓）。
+REDUCING_ORDER_TYPES = (OrderType.TAKE_PROFIT.value, OrderType.STOP_LOSS.value, OrderType.CLOSE.value)
+
 # 本地订单表中表示「仍在交易所开放/流转」的状态集合（对账与同步共用，避免各处硬编码不一致）。
 OPEN_ORDER_STATES = ("NEW", "OPEN", "PARTIALLY_FILLED", "SUBMITTING")
 

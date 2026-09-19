@@ -25,7 +25,7 @@
 | :--- | :--- | :--- | :--- |
 | P0-1 | 🔴 致命 | ~~部分成交后交易所撤余单，交易被判为 `CANCELLED` 并撤销全部保护单，留下无保护的实盘持仓~~ **✅ 已修复 2026-09-19** | `monitor.py:246-250`、`monitor.py:_handle_entry_terminated` |
 | P0-2 | 🔴 致命 | ~~OKX（`entry_protection_attached=True`）从不写入保护单记录，导致改止损/改止盈/取消止损/保本离场/自动保本在 OKX 上全部不可用~~ **✅ 已修复 2026-09-20** | `exchanges/okx.py`（改为成交后补建） |
-| P0-3 | 🔴 致命 | 保护单/平仓单的成交回报**完全没有处理**，止损止盈触发后本地永远停留在 `OPEN`；`CLOSING` 状态**无出边**，永久卡死 | `monitor.py:215-221`、`state_manager.py:18`、`trading_service.py:377` |
+| P0-3 | 🔴 致命 | ~~保护单/平仓单的成交回报完全没有处理，止损止盈触发后本地永远停留在 `OPEN`；`CLOSING` 无出边，永久卡死~~ **✅ 已修复 2026-09-20** | `monitor.py`、`state_manager.py`、`trading_service.py`、`order_sync.py` |
 | P1-1 | 🟠 高 | 保护单重建使用**确定性 `client_order_id`**，与 `orders.client_order_id UNIQUE` 冲突，重建必然 `IntegrityError` 并把交易锁死 | `monitor.py:531`、`database.py:25` |
 | P1-2 | 🟠 高 | `commands.payload_json` 取「最新一条」且**无 `rowid` 兜底**；SQLite `CURRENT_TIMESTAMP` 只有秒级精度，同秒内多条指令会取错，导致保护单用错价格或直接锁死交易 | `monitor.py:392`、`monitor.py:480` |
 | P1-3 | 🟠 高 | 重复收到已终态订单推送（WS 重连/重订阅必然发生）会**重跑** `_resize_take_profit`，撤掉已生效止盈后因唯一约束失败 → 仓位失去止盈且交易锁定 | `monitor.py:258-270`、`monitor.py:542-601` |
@@ -191,7 +191,7 @@ breakeven_triggered: 0 ; BREAKEVEN audits: []
 
 ---
 
-### P0-3 保护单/平仓单成交无处理，`CLOSING` 无出边 **[静态 + 已验证]**
+### P0-3 保护单/平仓单成交无处理，`CLOSING` 无出边 **[静态 + 已验证] [已修复 2026-09-20]**
 
 **位置**：`monitor.py:215-221`、`state_manager.py:12-19`、`trading_service.py:377`
 
@@ -309,6 +309,38 @@ with rowid tiebreak                     : amend
 `_resize_take_profit` / `_ensure_protection` 内部对相同 `(trade_id, order_type, quantity)`
 做「已存在且远程仍开放则跳过」的判定。
 
+**修复说明（2026-09-20）**：让减仓类订单（止盈/止损/平仓）的成交回报真正生效，并让 `CLOSING` 拥有可达的终态。
+
+改动点：
+
+| 位置 | 改动 |
+| :--- | :--- |
+| `models.py` | 新增 `OrderType` 与 `OPENING_ORDER_TYPES` / `REDUCING_ORDER_TYPES`，取代散落的字符串 |
+| `state_manager.py` | `OPEN` / `WAITING_ADD` 增加到 `CLOSED` 的出边（止盈止损直接终结，不经 `CLOSING`） |
+| `trading_service.py` | `_close_position()` 先落库 `CLOSE` 订单再下单（否则回报无处匹配） |
+| `monitor.py` | 新增 `_handle_reducing_fill()` 等三个方法，接管减仓成交回报 |
+| `order_sync.py` | 增加减仓订单已成交时的交易收敛（回报丢失后的兜底工具） |
+
+实现细节：
+
+- `_handle_reducing_fill()`：按成交事实把交易收敛为 `CLOSED` 并置 `breakeven_triggered=1`（停用自动保本，避免继续对已清空的仓位推止损）；对重复推送做幂等（已为终态则直接返回）。
+- `_mark_remaining_orders_stale()`：交易终结后把残留的本地「开放」记录收敛为 CANCELED，避免 `/status` 活动挂单计数与启动对账持续失真（**仅改本地，不触碰交易所**）。
+- `_revert_closing_on_failed_close()`：平仓单被拒/撤时仓位仍在，必须从 `CLOSING` 退回 `OPEN`；否则该状态既非终态（一直显示为活动交易），也不满足任何人工动作的前置条件。
+- 不核对「远程持仓是否恰好归零」：剩余数量可能因下一次开仓而变化，强行比对反而会误判；以交易所回报的减仓成交作为终结依据。
+- 不对部分成交的减仓单做交易终结：部分减仓后仓位仍在，交易必须保持 `OPEN`（已测试覆盖）。
+
+回归用例：
+
+| 用例 | 断言 |
+| :--- | :--- |
+| `test_stop_loss_fill_closes_trade_and_stops_breakeven` | 止损成交 → `CLOSED` + 停用保本 + 残留止盈收敛 |
+| `test_reducing_fill_is_idempotent_on_repeated_push` | 重放减仓回报不重复审计 |
+| `test_canceled_reducing_order_keeps_trade_open` | 减仓单被撤 → 交易保持 `OPEN` |
+| `test_close_position_fill_converges_closing_to_closed` | 平仓成交 → `CLOSING`→`CLOSED`，且平仓单已落库 |
+| `test_closed_trade_leaves_active_list_and_actions` | `CLOSED` 不再出现在活动交易与可用动作 |
+| `test_rejected_close_order_reverts_closing_to_open` | 平仓被拒 → 退回 `OPEN`，不卡死 |
+| `test_order_sync_converges_trade_when_reducing_order_filled` | 回报丢失时 order_sync 兜底收敛 |
+
 ---
 
 ## 4. 中优先级问题（P2）
@@ -407,7 +439,7 @@ with rowid tiebreak                     : amend
 | :--- | :--- | :--- |
 | 1 | ~~**P0-1** 部分成交撤单不得判 `CANCELLED`~~ **✅ 已修复** | 2026-09-19：`_handle_entry_terminated()` 改为按成交事实收敛，附 3 条回归用例 |
 | 2 | ~~**P0-2** OKX 保护单落库~~ **✅ 已修复** | 2026-09-20：改为成交后分别补建，附 6 条回归用例 |
-| 3 | **P0-3** 保护单/平仓单成交处理 + `CLOSING` 收敛 | 状态机与事实脱节，误导人工决策 |
+| 3 | ~~**P0-3** 保护单/平仓单成交处理 + `CLOSING` 收敛~~ **✅ 已修复** | 2026-09-20：减仓成交回报生效 + `CLOSING` 可达终态，附 7 条回归用例 |
 | 4 | **P1-1 / P1-3** 保护单编号唯一性 + 事件重放幂等 | 重启恢复与 WS 重连下的必然故障 |
 | 5 | **P1-2** 保护参数快照化（替代「最新指令」） | 根治保护单价格来源不可靠 |
 | 6 | **P2-1 ~ P2-5** | 风控真实性与权限边界 |
@@ -437,5 +469,5 @@ await monitor.process_event(Exchange.BINANCE, adapter, {
 })
 ```
 
-其中 **P0-1 已于 2026-09-19 修复并固化为 3 条回归用例**；P0-2 亦已于 2026-09-20 修复并固化为 6 条回归用例；建议继续将 P0-3、P1-1、P1-3 固化为 `tests/` 下的回归用例，
+其中 **P0-1 已于 2026-09-19 修复并固化为 3 条回归用例**；P0-2 与 P0-3 亦已于 2026-09-20 修复，分别固化为 6 条与 7 条回归用例；建议继续将 P1-1、P1-3 固化为 `tests/` 下的回归用例，
 它们共同覆盖了当前测试矩阵中缺失的「成交后生命周期」区域。

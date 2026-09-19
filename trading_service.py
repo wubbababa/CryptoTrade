@@ -358,9 +358,21 @@ class TradingService:
                          and item.side.value == trade["side"]), None)
         if trade_quantity is None or position is None or position.quantity != trade_quantity:
             raise ValueError("远程仓位不能唯一归属此交易，拒绝市价平仓")
+        close_client_id = self._client_order_id(command, "CLOSE")
         request = OrderRequest(instrument, command.side, "SELL" if command.side == PositionSide.LONG else "BUY",
-                               "MARKET", position.quantity, None, True, self._client_order_id(command, "CLOSE"))
+                               "MARKET", position.quantity, None, True, close_client_id)
+        # 先落库再下单：平仓单成交回报靠 client_order_id 与交易关联，若不落库则该回报会被
+        # 当成未知订单丢弃，交易永远停在 CLOSING（见 monitor._handle_reducing_fill）。
+        await self.database.execute(
+            "INSERT INTO orders(trade_id,exchange_order_id,client_order_id,order_type,price,quantity,status) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (trade["trade_id"], None, close_client_id, "CLOSE", None, str(position.quantity), "SUBMITTING"),
+        )
         result = await adapter.close_position(request)
+        await self.database.execute(
+            "UPDATE orders SET exchange_order_id=?,status=? WHERE client_order_id=?",
+            (result.exchange_order_id, result.status.upper(), close_client_id),
+        )
         # 平仓委托已受理后立即撤销同一 trade_id 的保护单，避免其作用于后续新仓。
         protection_rows = await self.database.fetch_all(
             "SELECT id,exchange_order_id,client_order_id FROM orders WHERE trade_id=? "
@@ -375,7 +387,10 @@ class TradingService:
             await adapter.cancel_order(remote_id)
             await self.database.execute("UPDATE orders SET status='CANCELED' WHERE id=?", (protection["id"],))
         await self.states.transition(trade["trade_id"], TradeState.CLOSING)
-        await self.database.audit("CLOSE_POSITION", trade["trade_id"], "SUCCESS", after=result.raw)
+        await self.database.audit("CLOSE_POSITION", trade["trade_id"], "SUCCESS", after={
+            "order_id": result.exchange_order_id, "client_order_id": close_client_id,
+            "quantity": str(position.quantity), "canceled_protections": len(protection_rows),
+        })
         return f"{trade['trade_id']} 已提交市价平仓，订单号 {result.exchange_order_id}"
 
     async def _filled_quantity(self, trade_id: str) -> Decimal | None:

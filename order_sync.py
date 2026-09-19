@@ -37,7 +37,13 @@ from decimal import Decimal, InvalidOperation
 
 from database import Database
 from exchange_router import ExchangeRouter
-from models import Exchange, OPEN_ORDER_STATES, TradeState
+from models import (
+    OPEN_ORDER_STATES,
+    REDUCING_ORDER_TYPES,
+    Exchange,
+    OrderType,
+    TradeState,
+)
 from settings import Settings
 from state_manager import StateManager
 
@@ -262,11 +268,33 @@ class RemoteOrderSync:
                                  else (detail.exchange_order_id if detail is not None else None))
         outcome = OrderSyncOutcome(exchange.value, client_id, trade_id, row["order_type"],
                                    row["status"], new_status if new_status != previous else None, note)
-        if row["order_type"] == "ENTRY" and new_status in TERMINAL_ORDER_STATES:
+        if row["order_type"] == OrderType.ENTRY.value and new_status in TERMINAL_ORDER_STATES:
             trade_note = await self._converge_trade(row, new_status, filled)
             if trade_note:
                 outcome.note += f"；{trade_note}"
+        elif row["order_type"] in REDUCING_ORDER_TYPES and new_status == "FILLED":
+            # 减仓订单（止盈/止损/平仓）已成交：仓位已被缩减/清空，交易应终结。
+            # 这是成交回报丢失（进程重启、WebSocket 断连）时的兜底修复路径。
+            trade_note = await self._converge_reducing_trade(row)
+            if trade_note:
+                outcome.note += f"；{trade_note}"
         return outcome
+
+    async def _converge_reducing_trade(self, row: dict) -> str | None:
+        """按「减仓订单已成交」的事实把交易收敛为 CLOSED；已是终态则跳过。"""
+        trade_id, state = row["trade_id"], row["state"]
+        if state in (TradeState.CLOSED.value, TradeState.CANCELLED.value, TradeState.REJECTED.value):
+            return None
+        if not self.dry_run:
+            await self.database.execute(
+                "UPDATE trade_instances SET state=?,breakeven_triggered=1,"
+                "updated_at=CURRENT_TIMESTAMP WHERE trade_id=?",
+                (TradeState.CLOSED.value, trade_id),
+            )
+        await self._audit("ORDER_SYNC", trade_id, "TRADE_CLOSED_BY_REDUCING_FILL",
+                          before={"state": state},
+                          after={"state": TradeState.CLOSED.value, "order_type": row["order_type"]})
+        return f"交易 {trade_id} 的 {row['order_type']} 已成交，收敛为 CLOSED 并停用自动保本"
 
     async def _sync_remote_only(self, exchange, remote_by_client: dict,
                                 local_rows: list[dict], instruments: dict) -> list[OrderSyncOutcome]:

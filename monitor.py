@@ -12,7 +12,15 @@ from decimal import Decimal
 from database import Database
 from breakeven_strategy import calculate_breakeven, should_trigger, stop_only_improves
 from exchange_router import ExchangeRouter
-from models import OPEN_ORDER_STATES, OrderRequest, PositionSide, TradeState
+from models import (
+    OPEN_ORDER_STATES,
+    OPENING_ORDER_TYPES,
+    REDUCING_ORDER_TYPES,
+    OrderRequest,
+    OrderType,
+    PositionSide,
+    TradeState,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -214,13 +222,19 @@ class Monitor:
         filled_quantity, average_price = order_event.filled_quantity, order_event.average_price
         rows = await self.database.fetch_all(
             "SELECT o.trade_id,o.order_type,t.state FROM orders o JOIN trade_instances t ON t.trade_id=o.trade_id "
-            "WHERE o.client_order_id=? AND o.order_type IN ('ENTRY','ADD_ENTRY')",
-            (client_order_id,),
+            "WHERE o.client_order_id=? AND o.order_type IN (?,?,?,?,?)",
+            (client_order_id, *OPENING_ORDER_TYPES, *REDUCING_ORDER_TYPES),
         )
         if not rows:
             return
         trade_id, order_type, current = rows[0]["trade_id"], rows[0]["order_type"], rows[0]["state"]
-        is_add_entry = order_type == "ADD_ENTRY"
+        is_add_entry = order_type == OrderType.ADD_ENTRY.value
+        # 只减仓类订单（止盈/止损/平仓）的成交意味着仓位被缩减或清空，收敛方向与开仓完全相反，
+        # 必须走独立分支，否则回报会被下面的开仓逻辑误解。
+        if order_type in REDUCING_ORDER_TYPES:
+            await self._handle_reducing_fill(exchange, adapter, trade_id, client_order_id, order_type,
+                                            status, filled_quantity, average_price)
+            return
         if status in {"FILLED", "FINISHED"} and filled_quantity is None:
             # 完全成交时可安全回填已提交数量；部分成交绝不猜测。
             await self.database.execute(
@@ -261,6 +275,114 @@ class Monitor:
             await self.database.audit("PROTECTION_ORDER", trade_id, f"FAILED: {exc}")
             logger.critical("%s 开仓已成交但保护单创建失败，交易已锁定：%s", trade_id, exc)
             await self._notify("CRITICAL", "PROTECTION_FAILED", f"开仓已成交但保护单创建失败：{exc}", trade_id)
+
+    async def _handle_reducing_fill(self, exchange, adapter, trade_id: str, client_order_id: str,
+                                    order_type: str, status: str, filled_quantity: Decimal | None,
+                                    average_price: Decimal | None) -> None:
+        """处理止盈/止损/平仓单的成交回报。
+
+        这些订单的成交**不会**出现在原来的 ENTRY/ADD_ENTRY 查询里，因此其回报曾被视为
+        未知订单直接丢弃：交易所上的仓位已经被止损/止盈/平仓清空，本地却一直停留在
+        OPEN/CLOSING，`/trades` 继续把已结束的交易列为「活动交易」并展示市价平仓按钮
+        （而该按钮又要求 state==OPEN 或只能平已不存在的仓位），自动保本也会继续对
+        已不存在的仓位推止损。这里按成交事实把交易收敛为 CLOSED 并停用保本。
+
+        只减仓成交不必核对「远程持仓是否恰好归零」：剩余数量可能因下一次开仓而变化，
+        强行比对反而会误判；以交易所回报的减仓成交作为终结依据即可。
+        """
+        # 无论终态如何，先把该订单行自身的状态与成交事实如实落库（与开仓单一致的处理）。
+        # 完全成交时允许回填委托数量；部分成交绝不猜测数量。
+        if status in {"FILLED", "FINISHED"} and filled_quantity is None:
+            await self.database.execute(
+                "UPDATE orders SET status=?,filled_quantity=quantity WHERE client_order_id=?",
+                (status, client_order_id),
+            )
+        elif filled_quantity is not None:
+            await self.database.execute(
+                "UPDATE orders SET status=?,filled_quantity=?,average_fill_price=COALESCE(?,average_fill_price) "
+                "WHERE client_order_id=?",
+                (status, str(filled_quantity),
+                 str(average_price) if average_price else None, client_order_id),
+            )
+        else:
+            await self.database.execute(
+                "UPDATE orders SET status=? WHERE client_order_id=?", (status, client_order_id))
+        if status not in {"FILLED", "FINISHED"}:
+            # 撤单/过期/拒单：本身不改变持仓。但平仓单失败时交易已被置为 CLOSING，
+            # 若不回退就会永久卡在 CLOSING（该状态既非终态、也无人工动作可用），
+            # 因此这里把「平仓单未成交」显式退回 OPEN，让持仓继续受保护单与人工指令管辖。
+            await self._revert_closing_on_failed_close(trade_id, order_type, status)
+            return
+        trade_rows = await self.database.fetch_all(
+            "SELECT state,instrument_key,side FROM trade_instances WHERE trade_id=?", (trade_id,)
+        )
+        if not trade_rows:
+            return
+        current = trade_rows[0]["state"]
+        # 幂等：同一笔减仓成交可能因 WebSocket 重连/重订阅被重复推送，已是终态则直接返回。
+        if current in {TradeState.CLOSED.value, TradeState.CANCELLED.value, TradeState.REJECTED.value}:
+            return
+        try:
+            # 停用自动保本：仓位已按交易所事实被缩减/清空，继续推止损会作用到错误仓位。
+            await self.database.execute(
+                "UPDATE trade_instances SET state=?,breakeven_triggered=1,"
+                "updated_at=CURRENT_TIMESTAMP WHERE trade_id=?",
+                (TradeState.CLOSED.value, trade_id),
+            )
+            await self.database.audit(
+                "TRADE_CLOSED_BY_FILL", trade_id, OrderType(order_type).value,
+                before={"state": current},
+                after={"state": TradeState.CLOSED.value, "order_type": order_type,
+                       "filled_quantity": str(filled_quantity) if filled_quantity is not None else None,
+                       "average_price": str(average_price) if average_price is not None else None},
+            )
+        except Exception as exc:
+            await self._set_state(trade_id, TradeState.ERROR_LOCKED, force=True)
+            await self.database.audit("TRADE_CLOSED_BY_FILL", trade_id, f"FAILED: {exc}")
+            await self._notify("CRITICAL", "CLOSE_CONVERGENCE_FAILED",
+                               f"减仓成交后交易状态收敛失败，已锁定：{exc}", trade_id)
+            return
+        # 清理同一交易其它仍在本地记为开放的挂单记录：仓位已终结，这些记录不再有意义。
+        await self._mark_remaining_orders_stale(trade_id)
+        label = {"TAKE_PROFIT": "止盈", "STOP_LOSS": "止损", "CLOSE": "市价平仓"}.get(order_type, order_type)
+        await self._notify("INFO", "TRADE_CLOSED_BY_FILL",
+                           f"{label}已在交易所成交，交易已收敛为 CLOSED 并停止自动保本", trade_id)
+
+    async def _revert_closing_on_failed_close(self, trade_id: str, order_type: str, status: str) -> None:
+        """平仓单未被成交（撤单/过期/拒单）时，把交易从 CLOSING 退回 OPEN。
+
+        平仓报价被交易所拒绝、或在成交前被撤销时，仓位其实仍然存在。若把交易留在
+        CLOSING，它既不在终态集合里（会一直显示为活动交易），也不满足任何人工动作的
+        状态前置条件（改止损/平仓都要求 OPEN），等于永久卡死。退回 OPEN 是安全且可恢复的。
+        """
+        if order_type != OrderType.CLOSE.value:
+            return
+        rows = await self.database.fetch_all("SELECT state FROM trade_instances WHERE trade_id=?", (trade_id,))
+        if not rows or rows[0]["state"] != TradeState.CLOSING.value:
+            return
+        await self._set_state(trade_id, TradeState.OPEN, force=True)
+        await self.database.audit("CLOSE_POSITION", trade_id, f"NOT_FILLED: {status}",
+                                  before={"state": TradeState.CLOSING.value},
+                                  after={"state": TradeState.OPEN.value})
+        await self._notify("WARNING", "CLOSE_POSITION_NOT_FILLED",
+                           f"平仓单未成交（{status}），交易已从 CLOSING 退回 OPEN；"
+                           "请核对持仓后重试或人工处置", trade_id)
+
+    async def _mark_remaining_orders_stale(self, trade_id: str) -> None:
+        """交易终结后，把本地仍标记为开放的挂单记录收敛为 CANCELED。
+
+        仓位已被减仓成交清空时，残留的本地「开放」记录会让 `/status` 的活动挂单计数
+        与启动对账持续失真；这里只改本地状态，**不触碰交易所**。
+        """
+        rows = await self.database.fetch_all(
+            "SELECT id,order_type,status FROM orders WHERE trade_id=? AND UPPER(status) IN ("
+            + ",".join("?" for _ in OPEN_ORDER_STATES) + ")",
+            (trade_id, *OPEN_ORDER_STATES),
+        )
+        for row in rows:
+            await self.database.execute("UPDATE orders SET status='CANCELED' WHERE id=?", (row["id"],))
+            await self.database.audit("ORDER_STALE_AFTER_CLOSE", trade_id, "CANCELED",
+                                      before={"order_type": row["order_type"], "status": row["status"]})
 
     async def _handle_entry_terminated(self, exchange, adapter, trade_id: str,
                                        is_add_entry: bool, current_state: str) -> None:

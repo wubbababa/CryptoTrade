@@ -13,7 +13,9 @@ import yaml
 
 from database import Database
 from exchange_router import ExchangeRouter
-from models import Exchange, OrderResult
+from exchanges.base import PaperAdapter
+from models import Exchange, OrderResult, PositionSnapshot
+from monitor import Monitor
 from order_sync import RemoteOrderSync, canonical_status
 from settings import Settings
 from trading_service import TradingService
@@ -300,3 +302,67 @@ def test_sync_position_snapshot_dry_run_keeps_stale_rows(settings):
     # 预演不删除、不写审计。
     assert [row["instrument_key"] for row in rows] == ["BTC/USDT:PERP"]
     assert audits == []
+
+
+def test_order_sync_converges_trade_when_reducing_order_filled(settings):
+    """P0-3 回归：减仓订单已成交但本地交易仍为 OPEN 时，order_sync 必须收敛为 CLOSED。
+
+    这是成交回报丢失（进程重启、WebSocket 断连）后的兜底修复路径。
+    """
+    class DeferredProtectionPaperAdapter(PaperAdapter):
+        @property
+        def entry_protection_attached(self) -> bool:
+            return False
+
+    async def scenario():
+        database = Database(settings.database_path)
+        database.initialize()
+        router = ExchangeRouter(settings)
+        original = router.get(Exchange.BINANCE)
+        adapter = DeferredProtectionPaperAdapter(original.instruments, original.equity)
+        router.adapters[Exchange.BINANCE] = adapter
+        service = TradingService(settings, database, router)
+        command = command_from_json(valid_payload(), "tg-sync-reduce-open", settings)
+        await service.execute(command)
+        entry = (await database.fetch_all("SELECT * FROM orders WHERE order_type='ENTRY'"))[0]
+        quantity = Decimal(entry["quantity"])
+        adapter.positions = [PositionSnapshot(
+            Exchange.BINANCE, command.instrument_key, command.side, quantity, Decimal("2480"))]
+        monitor = Monitor(router, database)
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {
+                "c": entry["client_order_id"], "X": "FILLED", "z": str(quantity), "ap": "2480"}}})
+        assert (await database.fetch_all("SELECT state FROM trade_instances"))[0]["state"] == "OPEN"
+
+        # 让桩反映真实行为：已成交的进场单不再是远端挂单，否则会被误判为「远端仍开放」。
+        adapter.orders[entry["exchange_order_id"]] = replace(
+            adapter.orders[entry["exchange_order_id"]], status="FILLED")
+        # 模拟「止损已在交易所成交，但成交回报丢失」：本地仍记 NEW，
+        # 远端挂单列表里已无该单（成交单不再是挂单），单笔查询返回 FILLED。
+        stop = (await database.fetch_all("SELECT * FROM orders WHERE order_type='STOP_LOSS'"))[0]
+        adapter.positions = []
+        # 换成真实交易所风格订单号：paper- 前缀会被同步工具视为「从未受理的模拟单」而短路。
+        real_stop_id = "200001"
+        adapter.orders.pop(stop["exchange_order_id"], None)
+        await database.execute(
+            "UPDATE orders SET status='NEW',exchange_order_id=? WHERE id=?", (real_stop_id, stop["id"]))
+
+        async def fake_get_order(client_order_id, exchange_order_id=None, instrument_key=""):
+            if client_order_id == stop["client_order_id"]:
+                return OrderResult(real_stop_id, stop["client_order_id"], "FILLED",
+                                   {"executedQty": str(quantity), "avgPrice": "2455"})
+            return None
+
+        adapter.get_order = fake_get_order
+        report = await RemoteOrderSync(database, router).sync("BINANCE")
+        trade = (await database.fetch_all("SELECT state,breakeven_triggered FROM trade_instances"))[0]
+        audits = await database.fetch_all(
+            "SELECT result FROM audit_logs WHERE category='ORDER_SYNC'")
+        await router.close()
+        return report, trade, audits
+
+    report, trade, audits = asyncio.run(scenario())
+    assert any("收敛为 CLOSED" in outcome.note for outcome in report.outcomes)
+    assert trade["state"] == "CLOSED"
+    assert trade["breakeven_triggered"] == 1
+    assert any(row["result"] == "TRADE_CLOSED_BY_REDUCING_FILL" for row in audits)
