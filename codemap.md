@@ -104,7 +104,7 @@ flowchart TD
 
 | 文件 | 核心类 / 函数 | 职责与功能说明 |
 | :--- | :--- | :--- |
-| [`monitor.py`](file:///f:/projects/CryptoTrade/monitor.py) | `Monitor`, `OrderEvent`, `_first_row`, `_parse_order_event` | **后台监控与启动对账引擎**：系统启动时按数量精确关联本地交易与远程仓位并恢复可监控交易；消费订单/行情事件，触发动态保本与保护单故障通知。`_first_row()` 归一各交易所推送正文形状（Gate 订阅回执的 `result` 是对象而非列表，直接按 `payload[0]` 索引会抛 `KeyError(0)` 并终止整个事件流）；`run_adapter()` 对单条畸形推送只跳过并记录，不再让该交易所的实时策略永久失效。订单推送经 `_parse_order_event()` 统一把成交量换算为标的数量（OKX/Gate 以合约张数成交，直接入库会让本地数量比远程仓位大若干倍，线上表现为「远程仓位=77.54，本地已关联交易数量=775.4；拒绝对汇总仓位执行自动保本」）；同一处仓位归属不一致只写一条审计与一条告警，不再随行情推送逐条刷屏（行情每秒可达十余条）。 |
+| [`monitor.py`](file:///f:/projects/CryptoTrade/monitor.py) | `Monitor`, `OrderEvent`, `_first_row`, `_parse_order_event` | **后台监控与启动对账引擎**：系统启动时按数量精确关联本地交易与远程仓位并恢复可监控交易；消费订单/行情事件，触发动态保本与保护单故障通知。`_first_row()` 归一各交易所推送正文形状（Gate 订阅回执的 `result` 是对象而非列表，直接按 `payload[0]` 索引会抛 `KeyError(0)` 并终止整个事件流）；`run_adapter()` 对单条畸形推送只跳过并记录，不再让该交易所的实时策略永久失效。订单推送经 `_parse_order_event()` 统一把成交量换算为标的数量（OKX/Gate 以合约张数成交，直接入库会让本地数量比远程仓位大若干倍，线上表现为「远程仓位=77.54，本地已关联交易数量=775.4；拒绝对汇总仓位执行自动保本」）；同一处仓位归属不一致只写一条审计与一条告警，不再随行情推送逐条刷屏（行情每秒可达十余条）。 **订单终结安全收敛**：`_handle_entry_terminated()` 与 `_remote_position()` 以「本地成交事实 + 远程持仓」双重判定进场/补仓单被终结后的去向：**只有零成交才允许撤销保护单并收敛为 `CANCELLED`**；部分成交后交易所撤余量时保留/补建保护单并转入 `OPEN`（避免实盘裸仓），成交但持仓无法确认时锁定人工处理。重查策略按「是否已有本地成交」分流，既覆盖持仓回报乱序，也避免零成交撤单路径被无谓拖慢。 |
 | [`telegram_client.py`](file:///f:/projects/CryptoTrade/telegram_client.py) | `TelegramClient`, `TelegramCallback` | **Telegram 接口交互**：使用 Telegram Bot API 长轮询接收频道/群组新消息，支持发送交易执行结果回报；来源频道文本仍按交易公告解析，白名单私聊中的 `/` 命令与中文快捷指令转交命令层，其余文本忽略。另支持内联按钮：`reply()` 可附带内联键盘，`edit_reply()` 就地刷新消息避免刷屏，`answer_callback()` 应答点击，`_extract_callback()` 把 `callback_query` 归一为 `TelegramCallback`，`_chat_allowed()` 让按钮点击与文本命令共用「来源频道 / 白名单聊天」权限边界。 |
 | [`telegram_commands.py`](file:///f:/projects/CryptoTrade/telegram_commands.py) | `TelegramCommandHandler`, `CommandReply`, `MANUAL_COMMAND_TYPES`, `parse_command`, `parse_manual_keyword`, `parse_price`, `UnknownCommand`, `CommandRejected` | **Telegram 对话命令层（含可点击按钮）**：查询命令 `/start`、`/help`、`/status`、`/trades` 汇总运行状态、活动交易**完整编号**与可用操作、本地活动挂单、各交易所权益与最近指令，并以**内联按钮**下发，可点击执行而不必手抄；人工指令 `/amend_entry`、`/cancel_order`、`/cancel_stop`、`/move_stop`、`/amend_take_profit`、`/close_position`，以及 `BTC 保本离场`、`BTC 保本`、`BTC 取消止损` 等中文快捷指令，统一翻译成 `TradeCommand` 交给 `TradingService`，本层**绝不直接调用交易所适配器**。写操作一律两步：先出确认键盘、再执行；按钮仅允许只读命令与人工指令白名单，伪造回调无法越权。中文快捷指令必须唯一匹配活动交易，仍复用「交易所/合约/方向 + 远程订单/持仓唯一关联」核对。 |
 | [`telegram_menu.py`](file:///f:/projects/CryptoTrade/telegram_menu.py) | `encode_callback`, `decode_callback`, `fingerprint`, `CallbackAction`, `main_menu_keyboard`, `trades_keyboard`, `confirm_keyboard`, `STATE_ACTIONS` | **Telegram 内联按钮菜单的纯逻辑层**（不依赖 aiohttp，便于单测）：用紧凑 `callback_data`（`cb:` 前缀）编码动作，交易编号以 8 位 SHA-256 指纹塞进 64 字节限制内；按交易状态（`PENDING_ENTRY`/`OPEN`/`WAITING_ADD`）只展示合法动作，避免出现必然被拒绝的按钮；只读/写指令白名单与两步确认文案集中在此，供命令层复用。 |
@@ -119,6 +119,12 @@ flowchart TD
 | :--- | :--- | :--- |
 | [`models.py`](file:///f:/projects/CryptoTrade/models.py) | `TradeCommand`, `EntrySpec`, `BreakevenSpec`, `Instrument`, `OrderRequest`, `OrderResult`, `PositionSnapshot`, `ASSET_ALIASES`, `normalize_asset` 等 | **统一领域实体定义**：所有金额与价格统一采用高精度 `Decimal`，严格定义各类枚举；`OrderRequest` 支持携带 `take_profit_price` 与 `stop_loss_price`；`ASSET_ALIASES` 字典与 `normalize_asset()` 函数提供中文/英文别名（如"黄金"→XAU、"大饼"→BTC）到标准 Ticker 代码的映射。 |
 | [`schemas/trade_command.schema.json`](file:///f:/projects/CryptoTrade/schemas/trade_command.schema.json) | JSON Schema 规范 | **指令交互协议**：定义大模型结构化输出的严格 JSON 字段结构与约束。 |
+
+### 2.7 评审与开发文档
+
+| 文件 | 内容 | 职责与功能说明 |
+| :--- | :--- | :--- |
+| [`CODE_REVIEW.md`](file:///f:/projects/CryptoTrade/CODE_REVIEW.md) | 全量代码评审报告（2026-09-19，基线 `da31c83`） | **第三方代码走查结论**：静态通读 + 运行时复现。列出 P0~P3 共 13 项问题（部分成交撤单裸仓、OKX 保护单不落库、保护单/平仓成交无处理、保护单编号唯一性冲突、`commands` 取最新指令无序等），附复现脚本说明与建议修复顺序。**修复 P0/P1 前应优先阅读**。 |
 
 ---
 

@@ -766,3 +766,147 @@ def test_okx_contract_fills_use_base_quantity_for_breakeven(settings):
     assert trade["state"] == "OPEN"
     assert trade["breakeven_triggered"] == 1
     assert [(row["price"], row["status"]) for row in stops] == [("2455", "CANCELED"), ("2501.77", "NEW")]
+
+def test_partial_fill_then_cancel_keeps_position_protected(settings):
+    """P0-1 回归：部分成交后交易所撤掉余量，绝不撤销保护单、绝不判 CANCELLED。
+
+    交易所余量可能因 IOC/GTD 到期、风控撤单或人工撤单而终结，但此时远程已经存在
+    真实仓位。旧实现在 PARTIAL_FILL 收到 CANCELED 时会撤销全部保护单并把交易写成
+    CANCELLED，导致仓位永久裸奔（状态不在 OPEN，自动保本与重启恢复都不再接手）。
+    """
+    class DeferredProtectionPaperAdapter(PaperAdapter):
+        @property
+        def entry_protection_attached(self) -> bool:
+            return False
+
+    async def scenario():
+        database = Database(settings.database_path)
+        database.initialize()
+        router = ExchangeRouter(settings)
+        original = router.get(Exchange.BINANCE)
+        adapter = DeferredProtectionPaperAdapter(original.instruments, original.equity)
+        router.adapters[Exchange.BINANCE] = adapter
+        command = command_from_json(valid_payload(), "tg-p01-partial-cancel", settings)
+        await TradingService(settings, database, router).execute(command)
+        entry = (await database.fetch_all("SELECT * FROM orders WHERE order_type='ENTRY'"))[0]
+        partial_quantity = Decimal("2")
+        # 部分成交：远程已产生真实仓位，本地按实际成交量建好保护单。
+        adapter.positions = [PositionSnapshot(
+            Exchange.BINANCE, command.instrument_key, command.side, partial_quantity, Decimal("2480"),
+        )]
+        monitor = Monitor(router, database)
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {
+                "c": entry["client_order_id"], "X": "PARTIALLY_FILLED",
+                "z": str(partial_quantity), "ap": "2480",
+            }},
+        })
+        # 交易所随后终结余量（撤单/过期），远程仓位依旧存在。
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {"c": entry["client_order_id"], "X": "CANCELED"}},
+        })
+
+        trade = (await database.fetch_all("SELECT state FROM trade_instances"))[0]
+        orders = await database.fetch_all(
+            "SELECT order_type,quantity,status FROM orders ORDER BY id"
+        )
+        protections = await database.fetch_all(
+            "SELECT order_type,quantity,status FROM orders "
+            "WHERE order_type IN ('TAKE_PROFIT','STOP_LOSS') AND status='NEW'"
+        )
+        audits = await database.fetch_all(
+            "SELECT result FROM audit_logs WHERE category='ENTRY_TERMINATED'"
+        )
+        await router.close()
+        return trade, orders, protections, audits, partial_quantity
+
+    trade, orders, protections, audits, partial_quantity = asyncio.run(scenario())
+    # 关键断言：交易转入 OPEN 而不是 CANCELLED。
+    assert trade["state"] == "OPEN"
+    # 关键断言：保护单必须仍在，且数量等于真实成交量。
+    assert len(protections) == 2
+    assert {row["order_type"] for row in protections} == {"TAKE_PROFIT", "STOP_LOSS"}
+    assert {row["quantity"] for row in protections} == {str(partial_quantity)}
+    # 进场单本身仍如实记录为已撤销，但不再影响交易状态。
+    entry = [row for row in orders if row["order_type"] == "ENTRY"][0]
+    assert entry["status"] == "CANCELED"
+    assert audit_result_of(audits) == "KEPT_PROTECTED"
+
+
+def test_zero_fill_entry_cancel_still_converges_to_cancelled(settings):
+    """P0-1 回归：零成交撤单仍应安全收敛为 CANCELLED（原有行为不得回归）。"""
+    class DeferredProtectionPaperAdapter(PaperAdapter):
+        @property
+        def entry_protection_attached(self) -> bool:
+            return False
+
+    async def scenario():
+        database = Database(settings.database_path)
+        database.initialize()
+        router = ExchangeRouter(settings)
+        original = router.get(Exchange.BINANCE)
+        adapter = DeferredProtectionPaperAdapter(original.instruments, original.equity)
+        router.adapters[Exchange.BINANCE] = adapter
+        command = command_from_json(valid_payload(), "tg-p01-zero-cancel", settings)
+        await TradingService(settings, database, router).execute(command)
+        entry = (await database.fetch_all("SELECT * FROM orders WHERE order_type='ENTRY'"))[0]
+        monitor = Monitor(router, database)
+        # 完全没有成交，交易所直接撤单。
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {"c": entry["client_order_id"], "X": "CANCELED"}},
+        })
+        trade = (await database.fetch_all("SELECT state FROM trade_instances"))[0]
+        audits = await database.fetch_all(
+            "SELECT result FROM audit_logs WHERE category='ENTRY_TERMINATED'"
+        )
+        await router.close()
+        return trade, audits
+
+    trade, audits = asyncio.run(scenario())
+    assert trade["state"] == "CANCELLED"
+    assert audit_result_of(audits) == "CANCELLED_NO_FILL"
+
+
+def test_filled_then_cancel_locks_instead_of_dropping_protection(settings):
+    """P0-1 回归：本地有成交但远程未确认持仓时必须锁定，绝不静默撤销保护单。"""
+    class DeferredProtectionPaperAdapter(PaperAdapter):
+        @property
+        def entry_protection_attached(self) -> bool:
+            return False
+
+    async def scenario():
+        database = Database(settings.database_path)
+        database.initialize()
+        router = ExchangeRouter(settings)
+        original = router.get(Exchange.BINANCE)
+        adapter = DeferredProtectionPaperAdapter(original.instruments, original.equity)
+        router.adapters[Exchange.BINANCE] = adapter
+        command = command_from_json(valid_payload(), "tg-p01-orphan-fill", settings)
+        await TradingService(settings, database, router).execute(command)
+        entry = (await database.fetch_all("SELECT * FROM orders WHERE order_type='ENTRY'"))[0]
+        monitor = Monitor(router, database)
+        # 成交事件先到（本地记录成交量），但远程持仓查询此刻仍为空。
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {
+                "c": entry["client_order_id"], "X": "PARTIALLY_FILLED", "z": "2", "ap": "2480",
+            }},
+        })
+        await monitor.process_event(Exchange.BINANCE, adapter, {
+            "data": {"e": "ORDER_TRADE_UPDATE", "o": {"c": entry["client_order_id"], "X": "CANCELED"}},
+        })
+        trade = (await database.fetch_all("SELECT state FROM trade_instances"))[0]
+        audits = await database.fetch_all(
+            "SELECT result FROM audit_logs WHERE category='ENTRY_TERMINATED'"
+        )
+        await router.close()
+        return trade, audits
+
+    trade, audits = asyncio.run(scenario())
+    assert trade["state"] == "ERROR_LOCKED"
+    assert audit_result_of(audits) == "FILLED_WITHOUT_POSITION"
+
+
+def audit_result_of(audits):
+    """提取唯一一条审计结论，便于断言且避免索引硬编码。"""
+    assert len(audits) == 1, f"期望恰好一条审计，实际 {audits}"
+    return audits[0]["result"]

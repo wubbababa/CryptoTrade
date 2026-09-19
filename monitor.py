@@ -244,16 +244,9 @@ class Monitor:
                     await self._notify("CRITICAL", "PARTIAL_PROTECTION_FAILED", f"部分成交保护单创建失败：{exc}", trade_id)
             return
         if status not in {"FILLED", "FINISHED"}:
-            if status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"} and not is_add_entry and current in {
-                TradeState.PENDING_ENTRY.value, TradeState.PARTIAL_FILL.value,
-            }:
-                try:
-                    await self._cancel_pending_protection(adapter, trade_id)
-                    await self._set_state(trade_id, TradeState.CANCELLED)
-                except Exception as exc:
-                    await self._set_state(trade_id, TradeState.ERROR_LOCKED, force=True)
-                    await self._notify("CRITICAL", "PENDING_PROTECTION_CLEANUP_FAILED",
-                                       f"进场撤销后预挂保护单清理失败：{exc}", trade_id)
+            if status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}:
+                # 进场/补仓单被终结：是否安全收敛取决于「是否已产生真实成交」，见 _handle_entry_terminated。
+                await self._handle_entry_terminated(exchange, adapter, trade_id, is_add_entry, current)
             return
         try:
             if is_add_entry:
@@ -268,6 +261,108 @@ class Monitor:
             await self.database.audit("PROTECTION_ORDER", trade_id, f"FAILED: {exc}")
             logger.critical("%s 开仓已成交但保护单创建失败，交易已锁定：%s", trade_id, exc)
             await self._notify("CRITICAL", "PROTECTION_FAILED", f"开仓已成交但保护单创建失败：{exc}", trade_id)
+
+    async def _handle_entry_terminated(self, exchange, adapter, trade_id: str,
+                                       is_add_entry: bool, current_state: str) -> None:
+        """进场/补仓单被交易所终结（撤单、过期、拒绝）时的安全收敛。
+
+        关键安全边界：**只有零成交才允许撤销保护单并收敛为 CANCELLED**。
+        部分成交后交易所撤掉余量（IOC/GTD 到期、风控撤单、人工撤单）时，远程已经
+        存在一笔真实仓位；若照旧撤销保护单并标记 CANCELLED，该仓位会永久裸奔——
+        状态不在 OPEN，自动保本（只查 OPEN）与重启恢复（只认 PENDING_ENTRY/
+        PARTIAL_FILL/OPEN）都不会再接手。
+
+        因此这里一律以「本地成交事实 + 远程持仓」为准，而不是仅看订单终态：
+        - 零成交：安全清理预挂保护单并收敛为 CANCELLED（保持原有行为）；
+        - 有成交且远程持仓可确认：保留/补建保护单并转入 OPEN，纳入自动保本监控；
+        - 有成交但远程持仓无法确认：锁定人工处理，绝不猜测，也绝不撤销保护单。
+        """
+        # 远程查询失败时异常会向上冒泡，由 run_adapter 逐条跳过该推送；
+        # 此路径不会执行任何撤单动作，保护单得以保留，属于安全失败。
+        filled_quantity = await self._trade_quantity(trade_id)
+        has_fill = filled_quantity is not None and filled_quantity > 0
+        # 已有本地成交时，持仓快照可能因推送乱序而短暂缺失，需要重查后再判定；
+        # 尚无本地成交时只需一次探测（用于兜住「成交事件丢失但仓位存在」的场景），
+        # 避免零成交撤单这类常见路径被无谓地拖慢。
+        position = await self._remote_position(adapter, trade_id, retries=3 if has_fill else 1)
+        has_position = position is not None and position.quantity > 0
+
+        if not has_fill and not has_position:
+            # 零成交：尚未产生任何仓位，撤销预挂保护单并终结交易是安全的。
+            if is_add_entry:
+                # 补仓单零成交不影响既有持仓，保持 WAITING_ADD 等待人工重新挂单。
+                await self.database.audit("ENTRY_TERMINATED", trade_id, "ADD_ENTRY_NO_FILL")
+                return
+            try:
+                await self._cancel_pending_protection(adapter, trade_id)
+                await self._set_state(trade_id, TradeState.CANCELLED)
+                await self.database.audit("ENTRY_TERMINATED", trade_id, "CANCELLED_NO_FILL")
+            except Exception as exc:
+                await self._set_state(trade_id, TradeState.ERROR_LOCKED, force=True)
+                await self._notify("CRITICAL", "PENDING_PROTECTION_CLEANUP_FAILED",
+                                   f"进场撤销后预挂保护单清理失败：{exc}", trade_id)
+            return
+
+        if has_fill and not has_position:
+            # 本地有成交但远程查不到持仓（持仓推送延迟或归属不明）：
+            # 一律锁定人工处理，绝不撤销保护单，绝不凭空按本地数量重挂。
+            await self._set_state(trade_id, TradeState.ERROR_LOCKED, force=True)
+            await self.database.audit("ENTRY_TERMINATED", trade_id, "FILLED_WITHOUT_POSITION", after={
+                "filled_quantity": str(filled_quantity), "is_add_entry": is_add_entry,
+            })
+            await self._notify("CRITICAL", "ENTRY_TERMINATED_FILLED_WITHOUT_POSITION",
+                               f"订单已终结但本地有成交 {filled_quantity}、远程未确认持仓；"
+                               "已保留保护单并锁定人工处理", trade_id)
+            return
+
+        # 有真实成交：走与「完全成交」相同的收敛路径，保留/补建保护单后纳入自动保本监控。
+        try:
+            if is_add_entry:
+                # 补仓部分成交：按合并后的真实数量扩容原止盈，止损仍由人工指令重设。
+                await self._resize_take_profit(exchange, adapter, trade_id)
+            else:
+                await self._ensure_protection(exchange, adapter, trade_id)
+            await self._set_state(trade_id, TradeState.OPEN)
+            await self.database.audit("ENTRY_TERMINATED", trade_id, "KEPT_PROTECTED",
+                                      before={"state": current_state}, after={
+                                          "state": TradeState.OPEN.value,
+                                          "filled_quantity": str(filled_quantity) if filled_quantity is not None else None,
+                                          "remote_quantity": str(position.quantity),
+                                      })
+            await self._notify("WARNING", "ENTRY_TERMINATED_WITH_FILL",
+                               f"进场单余量已被交易所终结，但已成交 {position.quantity}；"
+                               "已保留保护单并转入 OPEN，自动保本继续生效", trade_id)
+        except Exception as exc:
+            await self._set_state(trade_id, TradeState.ERROR_LOCKED, force=True)
+            await self.database.audit("ENTRY_TERMINATED", trade_id, f"FAILED: {exc}")
+            await self._notify("CRITICAL", "ENTRY_TERMINATED_PROTECTION_FAILED",
+                               f"订单终结后保护单收敛失败，交易已锁定：{exc}", trade_id)
+
+    async def _remote_position(self, adapter, trade_id: str, retries: int = 3):
+        """按本地交易记录定位远程汇总持仓；交易不存在或远程无该持仓时返回 None。
+
+        订单终结推送与持仓回报可能乱序（撤单事件常先于仓位快照更新到达），而本方法的
+        结果会决定「保留保护单」还是「锁定交易」，因此默认与 `_ensure_protection`
+        一样做短暂重查，避免把仅仅延迟的持仓误判为不存在。
+        """
+        rows = await self.database.fetch_all(
+            "SELECT instrument_key,side FROM trade_instances WHERE trade_id=?", (trade_id,)
+        )
+        if not rows:
+            return None
+        instrument_key = rows[0]["instrument_key"]
+        side = PositionSide(rows[0]["side"])
+        position = None
+        for attempt in range(max(retries, 1)):
+            positions = await adapter.get_positions()
+            position = next(
+                (item for item in positions if item.instrument_key == instrument_key and item.side == side), None,
+            )
+            if position is not None and position.quantity > 0:
+                return position
+            if attempt < retries - 1:
+                await asyncio.sleep(0.5 * (attempt + 1))
+        return position
 
     async def _parse_order_event(self, exchange, adapter, event: dict) -> OrderEvent | None:
         """解析订单推送，并把交易所回报的成交量统一换算为标的（基础币）数量。"""
